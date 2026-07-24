@@ -518,13 +518,21 @@ export class WorkspacesScreen extends Component {
     if (!row) return null;
     const ci = row.pr && row.pr.ci;
     if (ci && ci.checks && ci.checks.length) {
-      const pending = ci.checks.some((c) => c.state === "pending");
+      // Once a PR is merged/closed its CI queue is settled — a check still marked
+      // "pending" (e.g. runbot's light build, which lingers after merge) is stale,
+      // not actually running. robodoo merges by rebasing + closing, so a merged PR
+      // reads as "closed" on GitHub; the mergebot scrape is what flags it merged.
+      const mbState = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
+      const merged = row.pr.state === "merged" || mbState === "merged";
+      const settled = merged || row.pr.state === "closed";
+      const pending = !settled && ci.checks.some((c) => c.state === "pending");
       let badge;
       if (ci.overall === "failure")
         badge = { cls: "fail", label: "ko", title: "a CI check failed" };
       else if (ci.overall === "success")
         badge = { cls: "pass", label: "ok", title: "all CI checks passing" };
-      else if (ci.overall === "pending" || pending)
+      else if (merged) badge = { cls: "pass", label: "ok", title: "merged — CI settled" };
+      else if (!settled && (ci.overall === "pending" || pending))
         badge = { cls: "run", label: "running", title: "CI running" };
       else badge = { cls: "unknown", label: "—", title: "no CI status" };
       badge.running = pending && (ci.overall === "success" || ci.overall === "failure");

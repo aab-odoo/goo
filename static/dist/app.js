@@ -12274,13 +12274,17 @@ var WorkspacesScreen = class extends Component {
     if (!row) return null;
     const ci = row.pr && row.pr.ci;
     if (ci && ci.checks && ci.checks.length) {
-      const pending = ci.checks.some((c) => c.state === "pending");
+      const mbState = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
+      const merged = row.pr.state === "merged" || mbState === "merged";
+      const settled = merged || row.pr.state === "closed";
+      const pending = !settled && ci.checks.some((c) => c.state === "pending");
       let badge2;
       if (ci.overall === "failure")
         badge2 = { cls: "fail", label: "ko", title: "a CI check failed" };
       else if (ci.overall === "success")
         badge2 = { cls: "pass", label: "ok", title: "all CI checks passing" };
-      else if (ci.overall === "pending" || pending)
+      else if (merged) badge2 = { cls: "pass", label: "ok", title: "merged \u2014 CI settled" };
+      else if (!settled && (ci.overall === "pending" || pending))
         badge2 = { cls: "run", label: "running", title: "CI running" };
       else badge2 = { cls: "unknown", label: "\u2014", title: "no CI status" };
       badge2.running = pending && (ci.overall === "success" || ci.overall === "failure");
