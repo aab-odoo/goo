@@ -858,6 +858,33 @@ class CiService:
             d -= timedelta(days=1)
         return out
 
+    def queue(self):
+        """The current 'Awaiting' queue size for this branch — batches approved but
+        not yet staged — scraped from the root runbot_merge dashboard. Volatile (the
+        queue drains constantly), so uncached. Returns the PR count, or None if the
+        page can't be read."""
+        html, err = self.io.http_get(f"{MERGEBOT_BASE}/runbot_merge", timeout=30)
+        if err or not html:
+            return None
+        # isolate this branch's block: its <h2><a href="/runbot_merge/<id>"> heading
+        # up to the next branch/project heading
+        start = html.find(f'href="/runbot_merge/{self.branch}"')
+        if start == -1:
+            return None
+        rest = html[start:]
+        nxt = re.search(r'href="/runbot_merge/\d+"', rest[1:])
+        block = rest[: nxt.start() + 1] if nxt else rest
+        # the Awaiting section is class="pr-listing pr-awaiting" (the Splits section is
+        # "splits pr-awaiting"); count the PR links up to the next sibling <div>
+        aw = re.search(r'class="[^"]*\bpr-listing pr-awaiting\b[^"]*"', block)
+        if not aw:
+            return 0
+        seg = block[aw.end() :]
+        end = seg.find("<div")
+        if end != -1:
+            seg = seg[:end]
+        return len(re.findall(r"/pull/\d+", seg))
+
 
 # ─────────────────────────── Nightly builds (HTML scraping) ─────────────────
 

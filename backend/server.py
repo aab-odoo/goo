@@ -1986,7 +1986,11 @@ def _api_nightly(body):
 @post_route("/api/ci/merge-stats")
 def _api_ci_merge_stats(body):
     days = min(max(int(body.get("days", 14)), 1), 60)
-    return {"ok": True, "days": CI.merge_stats(days=days, refresh=bool(body.get("refresh")))}
+    return {
+        "ok": True,
+        "days": CI.merge_stats(days=days, refresh=bool(body.get("refresh"))),
+        "awaiting": CI.queue(),
+    }
 
 
 @post_route("/api/nightly/errors")

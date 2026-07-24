@@ -14,9 +14,15 @@ export class CiScreen extends Component {
       <Panel title="'CI — merge queue'">
         <t t-set-slot="title-extra">
           <span class="dim ci-sub">master · last 14 days</span>
+          <span t-if="this.ci.awaiting() !== null" class="ci-queue" title="PRs approved and waiting to be staged (mergebot 'Awaiting' queue)">
+            <b t-out="this.ci.awaiting()"/> awaiting<t t-if="this.queueEta"> · <span class="ci-eta" t-att-title="this.queueEtaTitle"><t t-out="this.queueEta"/> to drain (14d avg)</span></t><t t-if="this.queueEtaToday"> · <span class="ci-eta" t-att-title="this.queueEtaTodayTitle"><t t-out="this.queueEtaToday"/> (today)</span></t>
+          </span>
         </t>
         <t t-set-slot="top-right">
           <span class="meta" t-if="this.stamp" t-out="this.stamp"/>
+          <a class="pbtn" t-att-href="this.mergebotUrl" target="_blank" rel="noopener" title="open the mergebot dashboard">
+            <t t-out="this.extIcon"/> Mergebot
+          </a>
           <button class="pbtn" t-att-disabled="this.ci.loading()" t-on-click="() => this.refresh()">
             <t t-out="this.refreshIcon"/> Refresh
           </button>
@@ -71,6 +77,11 @@ export class CiScreen extends Component {
 
   ci = usePlugin(CiPlugin);
   refreshIcon = m(ICONS.refresh);
+  mergebotUrl = "https://mergebot.odoo.com/runbot_merge";
+  // self-contained external-link glyph (explicit size/fill) for the Mergebot link
+  extIcon = m(
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M7 17 17 7M9 7h8v8"/></svg>`,
+  );
 
   setup() {
     this.ci.load();
@@ -114,6 +125,39 @@ export class CiScreen extends Component {
       hours += this._hours(i);
     });
     return (prs / hours).toFixed(1);
+  }
+
+  // rough time to clear the awaiting queue at a given merge rate (PRs/hour):
+  // awaiting PRs / rate → a formatted duration ("" when the rate is unknown)
+  _etaAt(rate) {
+    const n = this.ci.awaiting();
+    if (n == null || !(rate > 0)) return "";
+    const h = n / rate;
+    if (h < 1) return "<1h";
+    if (h < 72) return `~${Math.round(h)}h`;
+    return `~${Math.round(h / 24)}d`;
+  }
+
+  // today's own merge rate (the first row's PR/hour)
+  get _todayRate() {
+    const days = this.ci.days();
+    return days.length ? parseFloat(this.perHour(days[0], 0)) : 0;
+  }
+
+  get queueEta() {
+    return this._etaAt(parseFloat(this.totalPerHour));
+  }
+
+  get queueEtaTitle() {
+    return `at the last 14 days' average of ${this.totalPerHour} PRs merged/hour`;
+  }
+
+  get queueEtaToday() {
+    return this._etaAt(this._todayRate);
+  }
+
+  get queueEtaTodayTitle() {
+    return `at today's rate of ${this._todayRate.toFixed(1)} PRs merged/hour`;
   }
 
   // "Wed" from an ISO date (parsed as UTC to match the server's staged day)

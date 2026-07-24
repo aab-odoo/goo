@@ -10,6 +10,7 @@ export class CiPlugin extends Plugin {
   static sequence = 4;
 
   days = signal([]); // [{date, batches, merged, failed, killed, pending, prs_merged}]
+  awaiting = signal(null); // PRs approved but not yet staged (null = unknown)
   loading = signal(false);
   error = signal("");
   at = signal(0);
@@ -25,6 +26,7 @@ export class CiPlugin extends Plugin {
     try {
       const res = await postJSON("/api/ci/merge-stats", { refresh: !!force, days });
       this.days.set(res.days || []);
+      this.awaiting.set(res.awaiting ?? null);
       this._window = days;
       this.at.set(Date.now());
     } catch (e) {

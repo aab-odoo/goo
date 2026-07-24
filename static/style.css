@@ -6348,6 +6348,24 @@ a.ws-fp-branch:hover {
 .ci-sub {
   font-size: 12px;
 }
+/* the mergebot "Awaiting" queue size, beside the subtitle */
+.ci-queue {
+  margin-left: 10px;
+  padding: 1px 8px;
+  border-radius: 9px;
+  background: var(--l-amber-bg);
+  color: var(--amber);
+  font-size: 12px;
+}
+.ci-queue b {
+  font-weight: 700;
+}
+.ci-eta {
+  opacity: 0.8;
+}
+a.pbtn {
+  text-decoration: none;
+}
 .ci-content {
   overflow-x: auto;
 }

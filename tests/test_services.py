@@ -1055,6 +1055,29 @@ class CiServiceTest(unittest.TestCase):
         svc.merge_stats(days=3, refresh=True)
         self.assertTrue(any(f"until={t2}" in u for u in io.http_calls))  # page2 re-fetched
 
+    def test_queue_counts_only_this_branch_awaiting(self):
+        # the Splits list, the Blocked list, and saas-19.4's Awaiting must not count
+        root = (
+            '<h1>RD</h1><h2><a href="/runbot_merge/1">master</a></h2>'
+            '<div class="splits pr-awaiting"><h5>Splits</h5><ul>'
+            '<li><a href="https://github.com/odoo/odoo/pull/1">x</a></li></ul></div>'
+            '<div class="pr-listing pr-awaiting"><h5>Awaiting</h5><ul>'
+            '<li><a href="https://github.com/odoo/odoo/pull/10">a</a></li>'
+            '<li><a href="https://github.com/odoo/enterprise/pull/11">b</a></li>'
+            '<li><a href="https://github.com/odoo/odoo/pull/12">c</a></li></ul></div>'
+            '<div class="pr-listing pr-blocked"><h5>Blocked</h5><ul>'
+            '<li><a href="https://github.com/odoo/odoo/pull/99">z</a></li></ul></div>'
+            '<h2><a href="/runbot_merge/131">saas-19.4</a></h2>'
+            '<div class="pr-listing pr-awaiting"><h5>Awaiting</h5><ul>'
+            '<li><a href="https://github.com/odoo/odoo/pull/500">other</a></li></ul></div>'
+        )
+        io = FakeIO(http={"runbot_merge": (root, None)})
+        self.assertEqual(services.CiService(io, self.CACHE).queue(), 3)
+
+    def test_queue_none_when_page_unavailable(self):
+        io = FakeIO(http={"runbot_merge": ("", "timeout")})
+        self.assertIsNone(services.CiService(io, self.CACHE).queue())
+
 
 class TTLCacheTest(unittest.TestCase):
     def test_single_flight(self):
