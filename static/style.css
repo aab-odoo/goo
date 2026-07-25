@@ -15,7 +15,7 @@
   --text-dim: oklch(0.56 0.012 264);
   --text-faint: oklch(0.52 0.012 264);
 
-  --sidebar-width: 226px; /* shared by the body grid and the navbar column */
+  --sidebar-width: 204px; /* shared by the body grid and the navbar column */
 
   --accent: oklch(0.66 0.16 300);
   --accent-soft: oklch(0.66 0.16 300 / 0.14);
