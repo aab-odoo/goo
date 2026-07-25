@@ -128,15 +128,23 @@ export class WorkspacesScreen extends Component {
                 <div class="wt-group-items" t-att-class="{'with-header': !!grp.name}">
                   <button t-foreach="grp.items" t-as="row" t-key="row.ws.id" class="wt-item"
                           t-att-class="{selected: row.ws.id === this.wt.selectedId()}" t-on-click="() => this.wt.select(row.ws.id)"
-                          t-att-style="'padding-left:' + (16 + row.depth * 16) + 'px'"
+                          t-att-style="row.depth ? 'margin-left:' + (10 + row.depth * 16) + 'px' : ''"
                           t-att-title="this.branchOf(row.ws) + ' · ' + (row.ws.db || '') + (this.isDrifted(row.ws) ? ' · checkout drifted' : '')">
-                    <span class="wt-dot" t-att-class="this.listDotClass(row.ws)"/>
-                    <span class="wt-item-name" t-out="row.ws.name"/>
-                    <span t-if="this.isDrifted(row.ws)" class="wt-badge wt-badge-drift" title="checkout drifted — the main checkout no longer matches this workspace">drift</span>
-                    <span t-if="this.isWt(row.ws)" class="wt-badge" title="worktree workspace">wt</span>
-                    <span class="wt-sp"/>
-                    <span class="wt-status-dot" t-att-class="this.ciDotClass(row.ws)" t-att-title="this.ciDotTitle(row.ws)"/>
-                    <span class="wt-status-dot" t-att-class="this.mbDotClass(row.ws)" t-att-title="this.mbDotTitle(row.ws)"/>
+                    <span class="wt-item-top">
+                      <span t-if="this.hasDot(row.ws)" class="wt-dot" t-att-class="this.listDotClass(row.ws)"/>
+                      <span class="wt-item-name" t-out="row.ws.name"/>
+                      <span class="wt-sp"/>
+                      <span t-if="this.listAge(row.ws)" class="wt-item-age" t-att-title="this.ageTitle(row.ws)" t-out="this.listAge(row.ws)"/>
+                    </span>
+                    <span class="wt-item-bot">
+                      <span t-foreach="this.repoChips(row.ws)" t-as="chip" t-key="chip.repo" class="wt-chip" t-att-class="chip.cls" t-att-title="chip.title" t-out="chip.label"/>
+                      <span t-if="this.isDrifted(row.ws)" class="wt-chip drift" title="checkout drifted — the main checkout no longer matches this workspace">drift</span>
+                      <span t-if="this.isWt(row.ws)" class="wt-chip wt" title="worktree workspace">wt</span>
+                      <span class="wt-sp"/>
+                      <span t-foreach="this.listPills(row.ws)" t-as="pill" t-key="pill.key" class="wt-pill" t-att-class="pill.cls" t-att-title="pill.title">
+                        <span t-if="pill.sym" class="wt-pill-sym" t-out="pill.sym"/><t t-out="pill.label"/>
+                      </span>
+                    </span>
                   </button>
                 </div>
               </t>
@@ -602,25 +610,72 @@ export class WorkspacesScreen extends Component {
     appBus.dispatchEvent(new CustomEvent("mb-menu-hide"));
   }
 
-  // the two trailing status dots: a colour class per status (empty = neutral/unknown)
-  ciDotClass(ws) {
-    const s = this.wsCiStatus(ws);
-    return s ? "s-" + s.cls : "";
+  // ── list card ────────────────────────────────────────────────────────────────
+  // the lifecycle dot only shows when it says something: a live server keeps its
+  // state colour, a worktree / the loaded workspace gets the solid "active" dot.
+  // An idle, unloaded workspace shows nothing rather than a meaningless grey dot.
+  hasDot(ws) {
+    return this.isLive(ws) || this.isWt(ws) || this.isLoaded(ws);
   }
 
-  mbDotClass(ws) {
-    const s = this.mbStatus(ws);
-    return s ? "s-" + s.cls : "";
+  // one chip per checkout: accent when the repo sits on one of our feature
+  // branches (what the workspace actually works on), dim on a base branch
+  repoChips(ws) {
+    return this.wsRows(ws).map((r) => ({
+      repo: r.repo,
+      label: r.repo.slice(0, 3),
+      cls: BASE_BRANCH_RE.test(r.branch) ? "base" : r.present ? "" : "missing",
+      title: `${r.repo}: ${r.branch}${r.present ? "" : " — not checked out"}`,
+    }));
   }
 
-  ciDotTitle(ws) {
-    const s = this.wsCiStatus(ws);
-    return s ? "runbot: " + s.title : "runbot: no status";
+  // the trailing CI + mergebot pills; a workspace with neither reads as "no PR"
+  listPills(ws) {
+    const pills = [];
+    const ci = this.wsCiStatus(ws);
+    if (ci && ci.cls !== "unknown") {
+      const failed = (ci.checks || []).filter((c) => c.state === "failure").length;
+      pills.push({
+        key: "ci",
+        cls: ci.cls,
+        sym: ci.cls === "pass" ? "✓" : ci.cls === "fail" ? "✗" : "",
+        label: failed > 1 ? `CI ${failed}` : "CI",
+        title: "runbot: " + ci.title,
+      });
+    }
+    const mb = this.mbStatus(ws);
+    if (mb) {
+      pills.push({
+        key: "mb",
+        cls: mb.cls,
+        sym: mb.cls === "ready" || mb.cls === "merged" ? "✓" : mb.cls === "blocked" ? "✗" : "",
+        label: mb.cls === "merged" ? "merged" : "merge",
+        title: "mergebot: " + mb.label,
+      });
+    }
+    if (!pills.length)
+      pills.push({
+        key: "none",
+        cls: "none",
+        sym: "",
+        label: "no PR",
+        title: "no pull request on this workspace's branch",
+      });
+    return pills;
   }
 
-  mbDotTitle(ws) {
-    const s = this.mbStatus(ws);
-    return s ? "mergebot: " + s.label : "mergebot: no status";
+  // compact relative age ("16m", "3d") of the last intentional action on the
+  // workspace — the same timestamp the "recently used" order sorts on
+  listAge(ws) {
+    const ts = ws.last_activity || ws.created_at;
+    if (!ts) return "";
+    const rel = timeAgo(ts);
+    return rel === "just now" ? "now" : rel.replace(" ago", "");
+  }
+
+  ageTitle(ws) {
+    if (ws.last_activity) return "last used " + this.fmtWhen(ws.last_activity);
+    return ws.created_at ? "created " + this.fmtWhen(ws.created_at) : "";
   }
 
   // ── list / selection ─────────────────────────────────────────────────────────

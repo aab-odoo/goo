@@ -3599,17 +3599,12 @@ tr.active td.brg-commit {
 }
 .wt-group-items {
   position: relative;
-  margin-left: 12px;
+  /* a flex column so the cards stretch to the column width — a <button> with
+     width:auto would otherwise shrink to fit its own text (ragged right edge) */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding-top: 2px;
-}
-.wt-group-items.with-header::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 15px;
-  width: 1px;
-  background: var(--l-line);
 }
 
 /* card list layout (spec.card): one bordered card per item, labeled fields over rows */
@@ -4603,7 +4598,7 @@ a.commit-detail-hash svg {
 .wt-list-items {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 6px;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -4621,71 +4616,140 @@ a.commit-detail-hash svg {
 .wt-empty-cta p {
   margin: 0 0 4px;
 }
+/* a workspace card: name + age on top, repo chips / CI + mergebot pills below */
 .wt-item {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: 5px;
-  width: calc(100% - 23px);
-  min-height: 29px;
-  margin: 0 8px 0 15px;
-  padding: 4px 8px 4px 16px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin: 0 8px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--l-line);
+  border-radius: var(--r);
+  background: var(--l-card);
   text-align: left;
   cursor: pointer;
   font: inherit;
   color: var(--l-text);
 }
-.wt-group-items.with-header .wt-item::before {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 0;
-  width: 11px;
-  border-top: 1px solid var(--l-line);
+.wt-item-top,
+.wt-item-bot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
 }
-/* the two trailing status dots (after the name): runbot then mergebot. Neutral grey
-   when there's no status; coloured by the run/pass/fail (CI) or mergebot category. */
-.wt-status-dot {
+.wt-item-bot {
+  gap: 4px;
+}
+.wt-item-age {
   flex: none;
-  width: 8px;
-  height: 8px;
+  font-size: 10.5px;
+  color: var(--l-text-faint);
+  font-variant-numeric: tabular-nums;
+}
+/* per-repository chip: accent on a feature branch, dim on a base branch, dashed
+   when the branch isn't checked out at all */
+.wt-chip {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--l-accent);
+  background: var(--l-accent-soft);
+  border: 1px solid transparent;
+}
+.wt-chip.base {
+  color: var(--l-text-dim);
+  background: var(--l-panel);
+}
+.wt-chip.missing {
+  color: var(--l-text-faint);
+  background: transparent;
+  border-color: var(--l-line);
+  border-style: dashed;
+}
+.wt-chip.drift {
+  color: var(--l-amber);
+  background: var(--l-amber-bg);
+}
+.wt-chip.wt {
+  color: var(--l-blue);
+  background: var(--l-blue-bg);
+}
+/* CI / mergebot pill — colour by status (CI: pass/fail/run, mergebot category) */
+.wt-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--l-text-dim);
+  background: var(--l-panel);
+}
+.wt-pill-sym {
+  font-size: 11px;
+  line-height: 1;
+}
+.wt-pill.pass,
+.wt-pill.ready,
+.wt-pill.merged {
+  color: var(--l-green);
+  background: var(--l-green-bg);
+}
+.wt-pill.fail,
+.wt-pill.blocked {
+  color: var(--l-red);
+  background: var(--l-red-bg);
+}
+.wt-pill.run,
+.wt-pill.progress {
+  color: var(--l-amber);
+  background: var(--l-amber-bg);
+}
+.wt-pill.run::before,
+.wt-pill.progress::before {
+  content: "";
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--l-line);
+  background: currentColor;
+  animation: dash-blink 1.4s ease-in-out infinite;
 }
-.wt-status-dot.s-pass,
-.wt-status-dot.s-ready,
-.wt-status-dot.s-merged {
-  background: var(--l-green);
-}
-.wt-status-dot.s-fail,
-.wt-status-dot.s-blocked {
-  background: var(--l-red);
-}
-.wt-status-dot.s-run,
-.wt-status-dot.s-progress {
-  background: var(--l-amber);
-}
-.wt-status-dot.s-other {
-  background: var(--l-text-faint);
+.wt-pill.none {
+  color: var(--l-text-faint);
+  background: transparent;
+  padding: 0;
 }
 .wt-item:hover {
+  border-color: var(--l-panel-line);
   background: var(--l-panel);
 }
 .wt-item.selected {
+  border-color: var(--l-accent-line);
   background: var(--l-accent-soft);
 }
 .wt-item.selected .wt-item-name {
   color: var(--l-accent);
 }
 .wt-item-name {
-  /* hug the name so the wt badge sits right next to it (the wt-sp spacer
-     after the badge takes the stretch); still shrinks + ellipsizes */
+  /* hug the name so the badges sit right next to it (the wt-sp spacer after
+     them takes the stretch); still shrinks + ellipsizes */
   flex: 0 1 auto;
   min-width: 0;
-  font-size: 13px;
+  font-family: var(--mono);
+  font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
