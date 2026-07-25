@@ -24,7 +24,13 @@
 // only for the one-time migration of stored pre-workspace configs.
 
 import { Model, ORM, fields } from "../../../vendor/owl-orm/index.ts";
-import { DEFAULT_CONFIG, BASE_BRANCH_RE, MERGEBOT, baseBranchOf } from "./config.js";
+import {
+  ARCHIVED_CATEGORY,
+  DEFAULT_CONFIG,
+  BASE_BRANCH_RE,
+  MERGEBOT,
+  baseBranchOf,
+} from "./config.js";
 import { worktreeDirFor } from "./utils.js";
 // Plugin classes are imported for the models' action methods to resolve via usePlugin().
 // This makes config_models ↔ config_plugin / code_plugin a cycle, but every use is
@@ -214,6 +220,34 @@ export class Workspace extends Model {
     return this.checkouts().some((c) => c.repository().id === "community");
   }
 
+  // every workspace spawned from this one, at any depth, parent-before-child. The
+  // subtree that travels with it — see setCategory (archiving) and, on the delete
+  // side, cascadeRemoveDescendants (workspace_plugin.js), which walks the blob
+  // level-by-level instead so it can stop descending at a child it couldn't remove.
+  descendants() {
+    const byParent = new Map();
+    for (const w of this.orm.records(Workspace)) {
+      const p = w.parent();
+      if (!p) continue;
+      if (!byParent.has(p)) byParent.set(p, []);
+      byParent.get(p).push(w);
+    }
+    const out = [];
+    const seen = new Set([this.id]); // cycle guard — `parent` is set once, at creation,
+    let frontier = byParent.get(this.id) || []; // to an existing ancestor, but stay safe
+    while (frontier.length) {
+      const next = [];
+      for (const w of frontier) {
+        if (seen.has(w.id)) continue;
+        seen.add(w.id);
+        out.push(w);
+        next.push(...(byParent.get(w.id) || []));
+      }
+      frontier = next;
+    }
+    return out;
+  }
+
   // the worktree's on-disk directory: the value frozen at creation (worktree.dir),
   // else derived from <settings.worktree_dir>/<name>. Persisting it means a later
   // rename can't move the path off the real checkout (worktreeDirFor, utils.js).
@@ -254,15 +288,31 @@ export class Workspace extends Model {
     this.name.set(name);
     this.db.set(db);
     this.on_create_args.set(on_create_args);
-    if (category !== undefined) this.category.set(category);
+    if (category !== undefined) this.setCategory(category); // cascades in/out of "archived"
     reconcileCheckouts(this.orm, { id: this.id, checkouts });
     this.touchActivity();
   }
 
   // move the workspace to <category> ("" = uncategorized) leaving the rest —
-  // including its activity stamp — untouched (archiving is shelving, not use)
+  // including its activity stamp — untouched (archiving is shelving, not use).
+  // Crossing the archived boundary carries the whole sub-workspace subtree along: a
+  // sub-workspace only exists because of the workspace it was spawned from, so
+  // shelving that parent shelves the work spawned from it, and restoring the parent
+  // brings the subtree back with it (it also keeps parent and children in one list
+  // group, which is what makes the nested rendering possible).
   setCategory(category) {
-    this.category.set(category || "");
+    const cat = category || "";
+    const wasArchived = this.category() === ARCHIVED_CATEGORY;
+    const nowArchived = cat === ARCHIVED_CATEGORY;
+    this.category.set(cat);
+    if (nowArchived !== wasArchived) {
+      for (const child of this.descendants()) {
+        // leaving the archive only lifts the descendants that were shelved with it —
+        // one re-categorized in the meantime keeps the category it was given
+        if (nowArchived || child.category() === ARCHIVED_CATEGORY) child.category.set(cat);
+      }
+    }
+    this._configPlugin().touch();
   }
 
   // demote to root ("" = no parent) — used only by cascadeRemoveDescendants

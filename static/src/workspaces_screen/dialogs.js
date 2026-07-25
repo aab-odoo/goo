@@ -4,18 +4,13 @@
 // canonical `workspaces` key (full records spread — the legacy `targets` view
 // drops the stable ports).
 
-import { BASE_BRANCH_RE, baseBranchOf } from "../core/config.js";
+import { ARCHIVED_CATEGORY, BASE_BRANCH_RE, baseBranchOf } from "../core/config.js";
 import { newWorkspaceId } from "../core/config_plugin.js";
 import { RemoteBranchDialog } from "../core/dialogs.js";
 import { postJSON, repoBranchList, descendantWorkspaces } from "../core/utils.js";
 import { cascadeRemoveDescendants } from "../core/workspace_plugin.js";
 
 import { Component, onMounted, onWillUnmount, signal, t, useProps, xml } from "@odoo/owl";
-
-// the reserved category: archived workspaces group here, always rendered as the
-// LAST list group (even when categories are disabled). Not part of the
-// configurable workspace_categories order.
-export const ARCHIVED_CATEGORY = "archived";
 
 // the Category select options for the create/edit dialogs (shown only when the
 // workspace-categories setting is on; the empty placeholder = uncategorized).

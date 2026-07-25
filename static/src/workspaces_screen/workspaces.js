@@ -16,12 +16,11 @@ import { EventLogPlugin } from "../core/event_log_plugin.js";
 import { ServerPlugin } from "../core/server_plugin.js";
 import { StorePlugin } from "../core/store_plugin.js";
 import { WorkspacePlugin } from "../core/workspace_plugin.js";
-import { BASE_BRANCH_RE } from "../core/config.js";
+import { ARCHIVED_CATEGORY, BASE_BRANCH_RE } from "../core/config.js";
 import { ICONS, LogConsole, SearchBox, appBus, m, mbCategory } from "../core/common.js";
 import { branchKey } from "../core/models.js";
-import { repoBranchList, timeAgo, nestByParent } from "../core/utils.js";
+import { repoBranchList, timeAgo, nestByParent, descendantWorkspaces } from "../core/utils.js";
 import {
-  ARCHIVED_CATEGORY,
   adoptCurrentCheckout,
   categoryOptions,
   deleteWorkspaceDialog,
@@ -187,7 +186,7 @@ export class WorkspacesScreen extends Component {
                 <button class="dash-kebab" t-att-class="{open: this.menuOpen()}" title="more actions" t-on-click.stop="() => this.menuOpen.set(!this.menuOpen())"><t t-out="this.kebabIcon"/></button>
                 <div t-if="this.menuOpen()" class="dash-menu" t-on-click.stop="">
                   <button class="dash-menu-item" title="edit name / branches / database / args" t-on-click="() => this.headMenu(() => this.edit(this.sel))">Edit workspace…</button>
-                  <button class="dash-menu-item" t-att-title="this.isArchived(this.sel) ? 'move it back to uncategorized' : 'move it to the archived group (keeps branches, db and settings)'" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
+                  <button class="dash-menu-item" t-att-title="this.archiveTitle(this.sel)" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
                   <button class="dash-menu-item danger" t-att-disabled="!this.canDropDb(this.sel)" t-att-title="this.dropDbTitle(this.sel)" t-on-click="() => this.headMenu(() => this.dropDb(this.sel))">Drop database</button>
                   <button class="dash-menu-item danger" t-att-disabled="this.removeBlocked(this.sel)" t-att-title="this.removeTitle(this.sel)" t-on-click="() => this.headMenu(() => this.remove(this.sel))">Remove workspace</button>
                 </div>
@@ -727,8 +726,27 @@ export class WorkspacesScreen extends Component {
   // shelve / restore: archived workspaces keep everything (branches, db, server
   // config) — they just live in the always-last "archived" group and are skipped
   // by the list's runbot/mergebot polling. Unarchive returns to uncategorized.
+  // Either way the whole sub-workspace subtree comes along (Workspace.setCategory).
   toggleArchived(ws) {
     this.config.workspace(ws.id)?.setCategory(this.isArchived(ws) ? "" : ARCHIVED_CATEGORY);
+  }
+
+  // how many sub-workspaces this archive/unarchive carries along — unarchiving only
+  // lifts the ones actually shelved with it (Workspace.setCategory)
+  archiveCascadeCount(ws) {
+    const subs = descendantWorkspaces(this.config.config.workspaces || [], ws.id);
+    return this.isArchived(ws)
+      ? subs.filter((w) => w.category === ARCHIVED_CATEGORY).length
+      : subs.length;
+  }
+
+  // the kebab tooltip, naming the cascade so it isn't a surprise
+  archiveTitle(ws) {
+    const n = this.archiveCascadeCount(ws);
+    const also = n ? `, with its ${n} sub-workspace${n === 1 ? "" : "s"}` : "";
+    return this.isArchived(ws)
+      ? `move it back to uncategorized${also}`
+      : `move it to the archived group${also} (keeps branches, db and settings)`;
   }
 
   isCollapsed(id) {

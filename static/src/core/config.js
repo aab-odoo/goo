@@ -135,6 +135,11 @@ export const SECTIONS = [
 export const MERGEBOT = "https://mergebot.odoo.com";
 export const BASE_BRANCH_RE = /^(master|\d+\.\d+|saas-\d+\.\d+)$/;
 
+// the reserved workspace category: archived workspaces group here, always rendered
+// as the LAST list group (even when categories are disabled). Not part of the
+// configurable workspace_categories order.
+export const ARCHIVED_CATEGORY = "archived";
+
 // the canonical base branch a work branch's name derives from: 16.0-owl-fix →
 // 16.0, saas-19.4-x → saas-19.4, anything else → master
 export function baseBranchOf(branch) {

@@ -155,6 +155,7 @@ var SECTIONS = [
 ];
 var MERGEBOT = "https://mergebot.odoo.com";
 var BASE_BRANCH_RE = /^(master|\d+\.\d+|saas-\d+\.\d+)$/;
+var ARCHIVED_CATEGORY = "archived";
 function baseBranchOf(branch) {
   return (/^(saas-\d+\.\d+|\d+\.\d+|master)/.exec(branch) || ["", "master"])[1];
 }
@@ -3081,7 +3082,7 @@ var repoUrls = {
     return `https://github.com/${github}/pull/${number}`;
   }
 };
-var Workspace = class extends Model {
+var Workspace = class _Workspace extends Model {
   static id = "workspace";
   name = fields.char();
   created_at = fields.char();
@@ -3116,6 +3117,33 @@ var Workspace = class extends Model {
   }
   hasCommunity() {
     return this.checkouts().some((c) => c.repository().id === "community");
+  }
+  // every workspace spawned from this one, at any depth, parent-before-child. The
+  // subtree that travels with it — see setCategory (archiving) and, on the delete
+  // side, cascadeRemoveDescendants (workspace_plugin.js), which walks the blob
+  // level-by-level instead so it can stop descending at a child it couldn't remove.
+  descendants() {
+    const byParent = /* @__PURE__ */ new Map();
+    for (const w of this.orm.records(_Workspace)) {
+      const p = w.parent();
+      if (!p) continue;
+      if (!byParent.has(p)) byParent.set(p, []);
+      byParent.get(p).push(w);
+    }
+    const out = [];
+    const seen = /* @__PURE__ */ new Set([this.id]);
+    let frontier = byParent.get(this.id) || [];
+    while (frontier.length) {
+      const next = [];
+      for (const w of frontier) {
+        if (seen.has(w.id)) continue;
+        seen.add(w.id);
+        out.push(w);
+        next.push(...byParent.get(w.id) || []);
+      }
+      frontier = next;
+    }
+    return out;
   }
   // the worktree's on-disk directory: the value frozen at creation (worktree.dir),
   // else derived from <settings.worktree_dir>/<name>. Persisting it means a later
@@ -3152,14 +3180,28 @@ var Workspace = class extends Model {
     this.name.set(name);
     this.db.set(db);
     this.on_create_args.set(on_create_args);
-    if (category !== void 0) this.category.set(category);
+    if (category !== void 0) this.setCategory(category);
     reconcileCheckouts(this.orm, { id: this.id, checkouts });
     this.touchActivity();
   }
   // move the workspace to <category> ("" = uncategorized) leaving the rest —
-  // including its activity stamp — untouched (archiving is shelving, not use)
+  // including its activity stamp — untouched (archiving is shelving, not use).
+  // Crossing the archived boundary carries the whole sub-workspace subtree along: a
+  // sub-workspace only exists because of the workspace it was spawned from, so
+  // shelving that parent shelves the work spawned from it, and restoring the parent
+  // brings the subtree back with it (it also keeps parent and children in one list
+  // group, which is what makes the nested rendering possible).
   setCategory(category) {
-    this.category.set(category || "");
+    const cat = category || "";
+    const wasArchived = this.category() === ARCHIVED_CATEGORY;
+    const nowArchived = cat === ARCHIVED_CATEGORY;
+    this.category.set(cat);
+    if (nowArchived !== wasArchived) {
+      for (const child of this.descendants()) {
+        if (nowArchived || child.category() === ARCHIVED_CATEGORY) child.category.set(cat);
+      }
+    }
+    this._configPlugin().touch();
   }
   // demote to root ("" = no parent) — used only by cascadeRemoveDescendants
   // when this workspace's own removal was blocked; parent is otherwise fixed
@@ -9313,7 +9355,6 @@ var TodoScreen = class extends Component {
 };
 
 // static/src/workspaces_screen/dialogs.js
-var ARCHIVED_CATEGORY = "archived";
 function categoryOptions(config) {
   const opts = (config.config.workspace_categories || []).map((c) => ({
     value: c.id,
@@ -12023,7 +12064,7 @@ var WorkspacesScreen = class extends Component {
                 <button class="dash-kebab" t-att-class="{open: this.menuOpen()}" title="more actions" t-on-click.stop="() => this.menuOpen.set(!this.menuOpen())"><t t-out="this.kebabIcon"/></button>
                 <div t-if="this.menuOpen()" class="dash-menu" t-on-click.stop="">
                   <button class="dash-menu-item" title="edit name / branches / database / args" t-on-click="() => this.headMenu(() => this.edit(this.sel))">Edit workspace…</button>
-                  <button class="dash-menu-item" t-att-title="this.isArchived(this.sel) ? 'move it back to uncategorized' : 'move it to the archived group (keeps branches, db and settings)'" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
+                  <button class="dash-menu-item" t-att-title="this.archiveTitle(this.sel)" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
                   <button class="dash-menu-item danger" t-att-disabled="!this.canDropDb(this.sel)" t-att-title="this.dropDbTitle(this.sel)" t-on-click="() => this.headMenu(() => this.dropDb(this.sel))">Drop database</button>
                   <button class="dash-menu-item danger" t-att-disabled="this.removeBlocked(this.sel)" t-att-title="this.removeTitle(this.sel)" t-on-click="() => this.headMenu(() => this.remove(this.sel))">Remove workspace</button>
                 </div>
@@ -12486,8 +12527,21 @@ var WorkspacesScreen = class extends Component {
   // shelve / restore: archived workspaces keep everything (branches, db, server
   // config) — they just live in the always-last "archived" group and are skipped
   // by the list's runbot/mergebot polling. Unarchive returns to uncategorized.
+  // Either way the whole sub-workspace subtree comes along (Workspace.setCategory).
   toggleArchived(ws) {
     this.config.workspace(ws.id)?.setCategory(this.isArchived(ws) ? "" : ARCHIVED_CATEGORY);
+  }
+  // how many sub-workspaces this archive/unarchive carries along — unarchiving only
+  // lifts the ones actually shelved with it (Workspace.setCategory)
+  archiveCascadeCount(ws) {
+    const subs = descendantWorkspaces(this.config.config.workspaces || [], ws.id);
+    return this.isArchived(ws) ? subs.filter((w) => w.category === ARCHIVED_CATEGORY).length : subs.length;
+  }
+  // the kebab tooltip, naming the cascade so it isn't a surprise
+  archiveTitle(ws) {
+    const n = this.archiveCascadeCount(ws);
+    const also = n ? `, with its ${n} sub-workspace${n === 1 ? "" : "s"}` : "";
+    return this.isArchived(ws) ? `move it back to uncategorized${also}` : `move it to the archived group${also} (keeps branches, db and settings)`;
   }
   isCollapsed(id) {
     return this.collapsedGroups().has(id);
