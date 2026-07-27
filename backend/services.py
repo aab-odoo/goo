@@ -891,6 +891,9 @@ class NightlyService:
     )
     _BUNDLE_ROW_RE = re.compile(r'class="row bundle_row"')
     _BUNDLE_LINK_RE = re.compile(r'href="/runbot/bundle/(\d+)"[^>]*title="View Bundle ([^"]+)"')
+    # step names whose log offers [MEMINFO] lines — checked in this order, first
+    # match wins, so a build offering both takes the dedicated qunit-only run
+    _MEMINFO_STEP_NAMES = ("start_qunit_only", "test_only_no_limit_no_autotags")
 
     def __init__(self, io, cache):
         self.io = io
@@ -1263,16 +1266,16 @@ class NightlyService:
         return {"errors": all_errors, "metrics": agg_metrics}
 
     def batch_builds(self, url):
-        """[{"label", "url"}] of raw "start_qunit_only" step-log URLs for
-        builds offering that action on a runbot batch/build page — used by
-        the Memory panel to bulk-import builds from a batch (MemoryService.fetch
-        parses [MEMINFO] lines out of the raw log text, not a build's HTML
-        page). The action dropdown itself is built client-side by runbot's JS
-        from a <build-options-dropdown data-id data-log_list data-dest
-        data-log_url> element, so we read those data attributes and construct
-        the log URL directly rather than the (JS-rendered, never-present-in-
-        the-fetched-HTML) <a> links. Not cached: a one-off user action, not a
-        periodic poll."""
+        """[{"label", "url"}] of raw step-log URLs (one of `_MEMINFO_STEP_NAMES`)
+        for builds offering one of those steps on a runbot batch/build page —
+        used by the Memory panel to bulk-import builds from a batch
+        (MemoryService.fetch parses [MEMINFO] lines out of the raw log text,
+        not a build's HTML page). The action dropdown itself is built
+        client-side by runbot's JS from a <build-options-dropdown data-id
+        data-log_list data-dest data-log_url> element, so we read those data
+        attributes and construct the log URL directly rather than the
+        (JS-rendered, never-present-in-the-fetched-HTML) <a> links. Not
+        cached: a one-off user action, not a periodic poll."""
         if url.startswith("/"):
             url = f"{RUNBOT_BASE}{url}"
         html = self._fetch_html(url)
@@ -1282,7 +1285,11 @@ class NightlyService:
         for m in re.finditer(r"<build-options-dropdown\b([^>]*)>", html):
             attrs = m.group(1)
             log_list_m = re.search(r'data-log_list="([^"]*)"', attrs)
-            if not log_list_m or "start_qunit_only" not in log_list_m.group(1):
+            if not log_list_m:
+                continue
+            log_list = html_lib.unescape(log_list_m.group(1))
+            step = next((s for s in self._MEMINFO_STEP_NAMES if s in log_list), None)
+            if not step:
                 continue
             id_m = re.search(r'data-id="(\d+)"', attrs)
             dest_m = re.search(r'data-dest="([^"]*)"', attrs)
@@ -1298,7 +1305,7 @@ class NightlyService:
             builds.append(
                 {
                     "label": build_id,
-                    "url": f"{log_url}/runbot/static/build/{dest}/logs/start_qunit_only.txt",
+                    "url": f"{log_url}/runbot/static/build/{dest}/logs/{step}.txt",
                 }
             )
         return builds
