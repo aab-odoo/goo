@@ -3533,69 +3533,65 @@ tr.active td.brg-commit {
 
 /* workspace-list category groups: compact full-width bars followed by rows on a
    subtle branch line, matching the repository-tree shape of the data */
+/* a quiet uppercase section label, not a row of its own — the cards below are the
+   thing with weight, so the header recedes to a caret + label + count */
 .wt-group-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   width: 100%;
-  height: 34px;
+  height: 22px;
   margin: 0;
-  padding: 0 10px;
+  padding: 0 12px 0 8px;
   border: none;
   border-radius: 0;
   background: transparent;
   cursor: pointer;
   text-align: left;
 }
-.wt-group-head:hover {
-  background: var(--l-line-soft);
+.wt-group-head:hover .wt-group-name,
+.wt-group-head:hover .wt-group-count,
+.wt-group-head:hover .wt-group-caret {
+  color: var(--l-text-mid);
 }
 .wt-group + .wt-group .wt-group-head {
-  margin-top: 8px;
+  margin-top: 10px;
 }
+/* solid triangle: ▼ open, ▶ collapsed */
 .wt-group-caret {
   position: relative;
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   flex: none;
-  color: var(--l-text-dim);
+  color: var(--l-text-faint);
 }
 .wt-group-caret::before {
   content: "";
   position: absolute;
   top: 1px;
-  left: 1px;
-  width: 5px;
-  height: 5px;
-  border-right: 1.5px solid currentColor;
-  border-bottom: 1.5px solid currentColor;
-  transform: rotate(45deg);
+  left: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
   transition: transform 0.12s ease;
+  transform-origin: 4px 2.5px;
 }
 .wt-group-caret.collapsed::before {
-  transform: rotate(-45deg);
+  transform: rotate(-90deg);
 }
 .wt-group-name {
-  font-size: 13px;
+  font-size: 10.5px;
   font-weight: 700;
-  color: var(--l-text);
-}
-.wt-group-name::first-letter {
+  letter-spacing: 0.07em;
   text-transform: uppercase;
+  color: var(--l-text-dim);
 }
 .wt-group-count {
   flex: none;
-  min-width: 24px;
-  height: 18px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 18px;
-  text-align: center;
-  color: var(--l-text-mid);
-  background: var(--l-card);
-  border: none;
-  border-radius: 9px;
-  padding: 0 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--l-text-faint);
 }
 .wt-group-items {
   position: relative;
@@ -4420,12 +4416,14 @@ a.commit-detail-hash svg {
   padding: 0; /* full-bleed: the list column sticks to the left edge, full height */
 }
 
+/* the list column sits on the tinted app surface so the white cards inside it read
+   as cards; the detail column next door keeps the plain --l-card background */
 .wt-list {
   display: flex;
   flex-direction: column;
   gap: 0;
   min-height: 0;
-  background: var(--l-card);
+  background: var(--l-bg);
   border-right: 1px solid var(--l-line);
   padding: 0;
 }
@@ -4444,10 +4442,19 @@ a.commit-detail-hash svg {
   padding-bottom: 5px;
 }
 .wt-list-title h1 {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 18px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
   color: var(--l-text);
+}
+/* the one accent-filled button on the screen — "Add" is the list's primary action */
+.wt-list-title .pbtn.primary {
+  background: var(--l-accent);
+  border-color: var(--l-accent);
+}
+.wt-list-title .pbtn.primary:hover:not(:disabled) {
+  background: oklch(0.49 0.18 300);
+  border-color: oklch(0.49 0.18 300);
 }
 /* the detail column's heading: workspace name on the left, its database / port and
    the overflow menu trailing on the right */
@@ -4474,8 +4481,7 @@ a.commit-detail-hash svg {
   align-items: center;
   gap: 6px;
   flex: none;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--l-line-soft);
+  padding: 2px 10px 8px;
 }
 .wt-list-head .search-box {
   flex: 1;
@@ -4622,9 +4628,9 @@ a.commit-detail-hash svg {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
+  gap: 4px;
   margin: 0 8px 0 10px;
-  padding: 8px 10px;
+  padding: 6px 9px 7px;
   border: 1px solid var(--l-line);
   border-radius: var(--r);
   background: var(--l-card);
@@ -4632,6 +4638,9 @@ a.commit-detail-hash svg {
   cursor: pointer;
   font: inherit;
   color: var(--l-text);
+  transition:
+    border-color 0.1s ease,
+    box-shadow 0.1s ease;
 }
 .wt-item-top,
 .wt-item-bot {
@@ -4662,13 +4671,20 @@ a.commit-detail-hash svg {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.03em;
+  /* one neutral chip background for every repo — the list is a wall of these, so the
+     feature/base distinction rides on the text colour alone */
   color: var(--l-accent);
-  background: var(--l-accent-soft);
+  background: var(--l-panel);
   border: 1px solid transparent;
 }
 .wt-chip.base {
   color: var(--l-text-dim);
-  background: var(--l-panel);
+}
+/* on the selected card the feature chips fill in, giving the card an anchor that
+   survives the white background */
+.wt-item.selected .wt-chip:not(.base, .missing, .drift, .wt) {
+  color: var(--l-card);
+  background: var(--l-accent);
 }
 .wt-chip.missing {
   color: var(--l-text-faint);
@@ -4734,11 +4750,12 @@ a.commit-detail-hash svg {
 }
 .wt-item:hover {
   border-color: var(--l-panel-line);
-  background: var(--l-panel);
 }
+/* selected: an accent outline on the card, not a fill — the card stays white so its
+   own chips/pills keep their colours legible */
 .wt-item.selected {
-  border-color: var(--l-accent-line);
-  background: var(--l-accent-soft);
+  border-color: var(--l-accent);
+  box-shadow: 0 0 0 1px var(--l-accent);
 }
 .wt-item.selected .wt-item-name {
   color: var(--l-accent);
