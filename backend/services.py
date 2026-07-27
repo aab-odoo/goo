@@ -1263,34 +1263,44 @@ class NightlyService:
         return {"errors": all_errors, "metrics": agg_metrics}
 
     def batch_builds(self, url):
-        """[{"label", "url"}] of "start_qunit_only" build links from a runbot
-        batch/build page — used by the Memory panel to bulk-import builds from
-        a batch. Not cached: a one-off user action, not a periodic poll."""
+        """[{"label", "url"}] of raw "start_qunit_only" step-log URLs for
+        builds offering that action on a runbot batch/build page — used by
+        the Memory panel to bulk-import builds from a batch (MemoryService.fetch
+        parses [MEMINFO] lines out of the raw log text, not a build's HTML
+        page). The action dropdown itself is built client-side by runbot's JS
+        from a <build-options-dropdown data-id data-log_list data-dest
+        data-log_url> element, so we read those data attributes and construct
+        the log URL directly rather than the (JS-rendered, never-present-in-
+        the-fetched-HTML) <a> links. Not cached: a one-off user action, not a
+        periodic poll."""
         if url.startswith("/"):
             url = f"{RUNBOT_BASE}{url}"
         html = self._fetch_html(url)
         if not html:
             return []
         builds, seen = [], set()
-        for m in re.finditer(r"<a([^>]*)>(.*?)</a>", html, re.DOTALL):
-            attrs, inner = m.group(1), m.group(2)
-            if "dropdown-item" not in attrs:
+        for m in re.finditer(r"<build-options-dropdown\b([^>]*)>", html):
+            attrs = m.group(1)
+            log_list_m = re.search(r'data-log_list="([^"]*)"', attrs)
+            if not log_list_m or "start_qunit_only" not in log_list_m.group(1):
                 continue
-            text = re.sub(r"<[^>]+>", "", inner).strip()
-            if "start_qunit_only" not in text:
+            id_m = re.search(r'data-id="(\d+)"', attrs)
+            dest_m = re.search(r'data-dest="([^"]*)"', attrs)
+            log_url_m = re.search(r'data-log_url="([^"]*)"', attrs)
+            if not id_m or not dest_m or not log_url_m:
                 continue
-            href_m = re.search(r'href="([^"]+)"', attrs)
-            if not href_m:
+            build_id = id_m.group(1)
+            if build_id in seen:
                 continue
-            href = href_m.group(1)
-            if href in seen:
-                continue
-            seen.add(href)
-            if href.startswith("/"):
-                href = f"{RUNBOT_BASE}{href}"
-            build_m = re.search(r"/build/(\d+)", href)
-            label = build_m.group(1) if build_m else href.split("/")[-1]
-            builds.append({"label": label, "url": href})
+            seen.add(build_id)
+            log_url = html_lib.unescape(log_url_m.group(1))
+            dest = html_lib.unescape(dest_m.group(1))
+            builds.append(
+                {
+                    "label": build_id,
+                    "url": f"{log_url}/runbot/static/build/{dest}/logs/start_qunit_only.txt",
+                }
+            )
         return builds
 
 
