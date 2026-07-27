@@ -46,6 +46,9 @@ export class CodePane extends Component {
       <t t-else="">
       <div class="ws-sec">
         <span>Checkouts</span>
+        <button t-if="this.checkoutPrLinks.length" class="ws-sec-copy" title="copy pr links in clipboard" t-on-click="() => this.copyPrLinks()">
+          <t t-out="this.prsCopied() ? 'copied' : this.prCountLabel"/><t t-out="this.copyIcon"/>
+        </button>
         <button class="pbtn ghost ws-tool ws-tool-start" t-att-disabled="!this.editorPaths.length" t-att-title="this.editAllTitle()" t-on-click="() => this.openAllEditors()"><t t-out="this.codeIcon"/>Editor</button>
         <button class="pbtn ghost ws-tool" t-att-disabled="!this.canRebaseAll()" t-att-title="this.rebaseAllTitle()" t-on-click="() => this.rebaseAll()"><span class="restart"/>Fetch &amp; rebase all</button>
         <button class="pbtn ghost ws-tool" t-att-disabled="!this.canPushAll()" t-att-title="this.pushAllTitle()" t-on-click="() => this.pushAll()"><t t-out="this.pushIcon"/>Push all</button>
@@ -161,7 +164,9 @@ export class CodePane extends Component {
   codeIcon = m(ICONS.code); // "Editor" toolbar button
   kebabIcon = m(ICONS.kebab); // the per-checkout actions menu
   pushIcon = m(ICONS.push); // the "Push all" toolbar button
+  copyIcon = m(ICONS.copy); // the heading's "N prs" link-copier
   menuId = signal(""); // key of the checkout whose action menu is open ("" = none)
+  prsCopied = signal(false); // transient "copied" label on the PR-link copier
   rPlusPosts = signal({}); // "github#number" -> "posting" | "posted"
   // the open commit-history editor's payload ({row, commits, diff, conflict, seq},
   // null = the checkout grid). Loaded fully by openHistory BEFORE being set, so
@@ -571,6 +576,30 @@ export class CodePane extends Component {
         entry, // the rich repo entry (this.repos) the actions menu operates on
       };
     });
+  }
+
+  // the checkouts' pull request links, in row order and deduplicated (a base-branch
+  // checkout never has one). Backs the heading's "N prs" copier.
+  get checkoutPrLinks() {
+    const seen = new Set();
+    for (const r of this.checkoutRows) {
+      if (!r.pr || this.isBaseBranch(r.branch)) continue;
+      const url = r.pr.url || this.code.pullRequestUrl(r.github, r.pr.number);
+      if (url) seen.add(url);
+    }
+    return [...seen];
+  }
+
+  get prCountLabel() {
+    const n = this.checkoutPrLinks.length;
+    return `${n} pr${n === 1 ? "" : "s"}`;
+  }
+
+  // space-separated so the whole set pastes as one shareable line in a chat message
+  copyPrLinks() {
+    navigator.clipboard?.writeText(this.checkoutPrLinks.join(" "));
+    this.prsCopied.set(true);
+    setTimeout(() => this.prsCopied.set(false), 1400);
   }
 
   // One matrix per merged checkout PR. Rows are already sliced by the backend so

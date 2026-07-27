@@ -5045,6 +5045,34 @@ a.commit-detail-hash svg {
   text-transform: none;
   letter-spacing: 0;
 }
+/* the Checkouts heading's PR-link copier: reads as heading metadata (not a fifth
+   toolbar action), and only shows it is clickable on hover */
+.ws-sec-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font: inherit;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--l-text-dim);
+  cursor: pointer;
+}
+.ws-sec-copy:hover {
+  color: var(--l-accent);
+  background: var(--l-hover);
+}
+.ws-sec-copy svg {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+}
 .ws-refresh {
   flex: none;
   padding: 3px 8px;
