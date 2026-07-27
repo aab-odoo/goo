@@ -632,6 +632,50 @@ class NightlyServiceTest(unittest.TestCase):
             ],
         )
 
+    def test_batch_builds_falls_back_to_test_only_no_limit_no_autotags(self):
+        html = (
+            '<build-options-dropdown data-id="300" data-dest="300-master" '
+            'data-log_url="http://runbot1.odoo.com" '
+            'data-log_list="[&#34;restore&#34;, &#34;test_only_no_limit_no_autotags&#34;]">'
+            "</build-options-dropdown>"
+            '<build-options-dropdown data-id="301" data-dest="301-master" '
+            'data-log_url="http://runbot2.odoo.com" '
+            'data-log_list="[&#34;install_all&#34;]"></build-options-dropdown>'
+        )
+        io = FakeIO(http={"batch/1/build/1": (html, None)})
+        svc = services.NightlyService(io, TTLCache(60))
+        self.assertEqual(
+            svc.batch_builds("/runbot/batch/1/build/1"),
+            [
+                {
+                    "label": "300",
+                    "url": (
+                        "http://runbot1.odoo.com/runbot/static/build/300-master"
+                        "/logs/test_only_no_limit_no_autotags.txt"
+                    ),
+                }
+            ],
+        )
+
+    def test_batch_builds_prefers_start_qunit_only_when_both_present(self):
+        html = (
+            '<build-options-dropdown data-id="300" data-dest="300-master" '
+            'data-log_url="http://runbot1.odoo.com" '
+            'data-log_list="[&#34;test_only_no_limit_no_autotags&#34;, &#34;start_qunit_only&#34;]">'
+            "</build-options-dropdown>"
+        )
+        io = FakeIO(http={"batch/1/build/1": (html, None)})
+        svc = services.NightlyService(io, TTLCache(60))
+        self.assertEqual(
+            svc.batch_builds("/runbot/batch/1/build/1"),
+            [
+                {
+                    "label": "300",
+                    "url": "http://runbot1.odoo.com/runbot/static/build/300-master/logs/start_qunit_only.txt",
+                }
+            ],
+        )
+
     # ── caching ──────────────────────────────────────────────────────────
 
     def test_versions_cached_then_bypassed_on_refresh(self):
