@@ -12300,12 +12300,21 @@ var WorkspacesScreen = class extends Component {
       };
     });
   }
+  // the workspaces whose runbot / mergebot status is worth scraping: the active
+  // ones, plus the selected one even if it is archived — archived means dormant
+  // (don't poll a graveyard of dead workspaces on every visit), but a workspace
+  // you explicitly opened is not dormant, and its detail header needs the state.
+  _polledWorkspaces() {
+    const selected = this.wt.selectedId();
+    return (this.config.config.workspaces || []).filter(
+      (ws) => ws.category !== ARCHIVED_CATEGORY || ws.id === selected
+    );
+  }
   // branches needing the scraped runbot fallback: present, ours, pushed (or a base
   // branch), and not already covered by a PR's GitHub CI rollup
   _runbotBranches() {
     const seen = /* @__PURE__ */ new Set();
-    for (const ws of this.config.config.workspaces || []) {
-      if (ws.category === ARCHIVED_CATEGORY) continue;
+    for (const ws of this._polledWorkspaces()) {
       for (const row of this.wsRows(ws)) {
         if (!row.present || this.code.isExternalRepo(row.github)) continue;
         if (!BASE_BRANCH_RE.test(row.branch) && !row.synced) continue;
@@ -12316,15 +12325,13 @@ var WorkspacesScreen = class extends Component {
     }
     return [...seen];
   }
-  // the unique {github, number} of every PR across the list (for mergebot),
-  // skipping archived workspaces (dormant — don't poll)
+  // the unique {github, number} of every PR across the polled workspaces (for mergebot)
   _prs() {
     const seen = /* @__PURE__ */ new Set();
     const prs = [];
-    for (const ws of this.config.config.workspaces || []) {
-      if (ws.category === ARCHIVED_CATEGORY) continue;
-      for (const row of this.wsRows(ws)) {
-        if (!row.pr || !row.github || this.code.isExternalRepo(row.github)) continue;
+    for (const ws of this._polledWorkspaces()) {
+      for (const row of this.prRows(ws)) {
+        if (this.code.isExternalRepo(row.github)) continue;
         const key = `${row.github}#${row.pr.number}`;
         if (seen.has(key)) continue;
         seen.add(key);
