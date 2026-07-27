@@ -4408,7 +4408,7 @@ a.commit-detail-hash svg {
 /* two columns — worktree list | detail — filling the content area */
 .content.wt-content {
   display: grid;
-  grid-template-columns: minmax(250px, 340px) 1fr;
+  grid-template-columns: minmax(250px, 372px) 1fr;
   grid-template-rows: minmax(0, 1fr);
   gap: 0;
   min-height: 0;
@@ -4446,15 +4446,6 @@ a.commit-detail-hash svg {
   font-weight: 680;
   letter-spacing: -0.015em;
   color: var(--l-text);
-}
-/* the one accent-filled button on the screen — "Add" is the list's primary action */
-.wt-list-title .pbtn.primary {
-  background: var(--l-accent);
-  border-color: var(--l-accent);
-}
-.wt-list-title .pbtn.primary:hover:not(:disabled) {
-  background: oklch(0.49 0.18 300);
-  border-color: oklch(0.49 0.18 300);
 }
 /* the detail column's heading: workspace name on the left, its database / port and
    the overflow menu trailing on the right */
@@ -4680,12 +4671,6 @@ a.commit-detail-hash svg {
 .wt-chip.base {
   color: var(--l-text-dim);
 }
-/* on the selected card the feature chips fill in, giving the card an anchor that
-   survives the white background */
-.wt-item.selected .wt-chip:not(.base, .missing, .drift, .wt) {
-  color: var(--l-card);
-  background: var(--l-accent);
-}
 .wt-chip.missing {
   color: var(--l-text-faint);
   background: transparent;
@@ -4750,11 +4735,12 @@ a.commit-detail-hash svg {
 }
 .wt-item:hover {
   border-color: var(--l-panel-line);
+  background: var(--l-panel);
 }
-/* selected: an accent outline on the card, not a fill — the card stays white so its
-   own chips/pills keep their colours legible */
+/* selected: accent outline + the soft accent wash behind it */
 .wt-item.selected {
   border-color: var(--l-accent);
+  background: var(--l-accent-soft);
   box-shadow: 0 0 0 1px var(--l-accent);
 }
 .wt-item.selected .wt-item-name {
