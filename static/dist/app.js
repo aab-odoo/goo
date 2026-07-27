@@ -12357,30 +12357,45 @@ var WorkspacesScreen = class extends Component {
     const branch = this.bundleBranch(ws);
     return present.find((r) => r.branch === branch) || present[0] || null;
   }
-  // the workspace's runbot/CI badge. Prefers the PR's GitHub CI rollup; falls back
-  // to the scraped runbot bundle.
+  // every checkout row of the workspace whose branch carries a pull request. A
+  // workspace's change can live in one repo only (an enterprise-only PR) or in
+  // several, so anything PR-derived reads all of them, never just the bundle row.
+  prRows(ws) {
+    return this.wsRows(ws).filter((r) => r.pr && r.github);
+  }
+  // the workspace's runbot/CI badge, rolled up over *all* its PRs (worst wins);
+  // falls back to the scraped runbot bundle when no PR reports checks.
   wsCiStatus(ws) {
-    const row = this.bundleRow(ws);
-    if (!row) return null;
-    const ci = row.pr && row.pr.ci;
-    if (ci && ci.checks && ci.checks.length) {
-      const mbState = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
-      const merged = row.pr.state === "merged" || mbState === "merged";
-      const settled = merged || row.pr.state === "closed";
-      const pending = !settled && ci.checks.some((c) => c.state === "pending");
+    const rows = this.prRows(ws).filter((r) => r.pr.ci && (r.pr.ci.checks || []).length);
+    if (rows.length) {
+      const multi = rows.length > 1;
+      const checks = [];
+      let failed = false;
+      let settledOk = true;
+      let pending = false;
+      for (const row2 of rows) {
+        const ci = row2.pr.ci;
+        const mbState = this.code.mergebot()[`${row2.github}#${row2.pr.number}`] || "";
+        const merged = row2.pr.state === "merged" || mbState === "merged";
+        const settled = merged || row2.pr.state === "closed";
+        if (ci.overall === "failure") failed = true;
+        if (ci.overall !== "success" && !merged) settledOk = false;
+        if (!settled && (ci.overall === "pending" || ci.checks.some((c) => c.state === "pending")))
+          pending = true;
+        for (const c of ci.checks)
+          checks.push(multi ? { ...c, context: `${row2.repo}: ${c.context}` } : c);
+      }
       let badge2;
-      if (ci.overall === "failure")
-        badge2 = { cls: "fail", label: "ko", title: "a CI check failed" };
-      else if (ci.overall === "success")
-        badge2 = { cls: "pass", label: "ok", title: "all CI checks passing" };
-      else if (merged) badge2 = { cls: "pass", label: "ok", title: "merged \u2014 CI settled" };
-      else if (!settled && (ci.overall === "pending" || pending))
-        badge2 = { cls: "run", label: "running", title: "CI running" };
+      if (failed) badge2 = { cls: "fail", label: "ko", title: "a CI check failed" };
+      else if (settledOk) badge2 = { cls: "pass", label: "ok", title: "all CI checks passing" };
+      else if (pending) badge2 = { cls: "run", label: "running", title: "CI running" };
       else badge2 = { cls: "unknown", label: "\u2014", title: "no CI status" };
-      badge2.running = pending && (ci.overall === "success" || ci.overall === "failure");
-      badge2.checks = ci.checks;
+      badge2.running = pending && (failed || settledOk);
+      badge2.checks = checks;
       return badge2;
     }
+    const row = this.bundleRow(ws);
+    if (!row) return null;
     const s = this.code.runbot()[row.branch] || null;
     const result = s && s.result || "";
     const running = !!(s && s.running);
@@ -12398,8 +12413,7 @@ var WorkspacesScreen = class extends Component {
   mbStatus(ws) {
     const rows = [];
     const RANK = { blocked: 0, progress: 1, ready: 2, merged: 3, other: 4 };
-    for (const row of this.wsRows(ws)) {
-      if (!row.pr || !row.github) continue;
+    for (const row of this.prRows(ws)) {
       const state = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
       if (!state) continue;
       rows.push({
@@ -12418,8 +12432,11 @@ var WorkspacesScreen = class extends Component {
     const branch = this.bundleBranch(ws);
     const scraped = branch && this.code.runbot()[branch]?.url;
     if (scraped) return scraped;
-    const checks = this.bundleRow(ws)?.pr?.ci?.checks || [];
-    return checks.find((c) => c.context === "ci/runbot")?.url || "";
+    for (const row of this.prRows(ws)) {
+      const url = (row.pr.ci?.checks || []).find((c) => c.context === "ci/runbot")?.url;
+      if (url) return url;
+    }
+    return "";
   }
   showCiMenu(ev, checks) {
     if (!checks || !checks.length) return;
@@ -12478,14 +12495,24 @@ var WorkspacesScreen = class extends Component {
         title: "mergebot: " + mb.label
       });
     }
-    if (!pills.length)
-      pills.push({
-        key: "none",
-        cls: "none",
-        sym: "",
-        label: "no PR",
-        title: "no pull request on this workspace's branch"
-      });
+    if (!pills.length) {
+      const prs = this.prRows(ws);
+      pills.push(
+        prs.length ? {
+          key: "pr",
+          cls: "none",
+          sym: "",
+          label: prs.length > 1 ? "PRs" : `#${prs[0].pr.number}`,
+          title: prs.map((r) => `${r.github}#${r.pr.number}`).join(", ") + " \u2014 no CI yet"
+        } : {
+          key: "none",
+          cls: "none",
+          sym: "",
+          label: "no PR",
+          title: "no pull request on this workspace's branch"
+        }
+      );
+    }
     return pills;
   }
   // compact relative age ("16m", "3d") of the last intentional action on the

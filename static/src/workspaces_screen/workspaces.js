@@ -518,35 +518,52 @@ export class WorkspacesScreen extends Component {
     return present.find((r) => r.branch === branch) || present[0] || null;
   }
 
-  // the workspace's runbot/CI badge. Prefers the PR's GitHub CI rollup; falls back
-  // to the scraped runbot bundle.
+  // every checkout row of the workspace whose branch carries a pull request. A
+  // workspace's change can live in one repo only (an enterprise-only PR) or in
+  // several, so anything PR-derived reads all of them, never just the bundle row.
+  prRows(ws) {
+    return this.wsRows(ws).filter((r) => r.pr && r.github);
+  }
+
+  // the workspace's runbot/CI badge, rolled up over *all* its PRs (worst wins);
+  // falls back to the scraped runbot bundle when no PR reports checks.
   wsCiStatus(ws) {
-    const row = this.bundleRow(ws);
-    if (!row) return null;
-    const ci = row.pr && row.pr.ci;
-    if (ci && ci.checks && ci.checks.length) {
-      // Once a PR is merged/closed its CI queue is settled — a check still marked
-      // "pending" (e.g. runbot's light build, which lingers after merge) is stale,
-      // not actually running. robodoo merges by rebasing + closing, so a merged PR
-      // reads as "closed" on GitHub; the mergebot scrape is what flags it merged.
-      const mbState = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
-      const merged = row.pr.state === "merged" || mbState === "merged";
-      const settled = merged || row.pr.state === "closed";
-      const pending = !settled && ci.checks.some((c) => c.state === "pending");
+    const rows = this.prRows(ws).filter((r) => r.pr.ci && (r.pr.ci.checks || []).length);
+    if (rows.length) {
+      const multi = rows.length > 1;
+      const checks = [];
+      let failed = false;
+      let settledOk = true; // every PR either green or merged
+      let pending = false;
+      for (const row of rows) {
+        const ci = row.pr.ci;
+        // Once a PR is merged/closed its CI queue is settled — a check still marked
+        // "pending" (e.g. runbot's light build, which lingers after merge) is stale,
+        // not actually running. robodoo merges by rebasing + closing, so a merged PR
+        // reads as "closed" on GitHub; the mergebot scrape is what flags it merged.
+        const mbState = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
+        const merged = row.pr.state === "merged" || mbState === "merged";
+        const settled = merged || row.pr.state === "closed";
+        if (ci.overall === "failure") failed = true;
+        if (ci.overall !== "success" && !merged) settledOk = false;
+        if (!settled && (ci.overall === "pending" || ci.checks.some((c) => c.state === "pending")))
+          pending = true;
+        // with several PRs in play the hover list must say which repo each check is from
+        for (const c of ci.checks)
+          checks.push(multi ? { ...c, context: `${row.repo}: ${c.context}` } : c);
+      }
       let badge;
-      if (ci.overall === "failure")
-        badge = { cls: "fail", label: "ko", title: "a CI check failed" };
-      else if (ci.overall === "success")
-        badge = { cls: "pass", label: "ok", title: "all CI checks passing" };
-      else if (merged) badge = { cls: "pass", label: "ok", title: "merged — CI settled" };
-      else if (!settled && (ci.overall === "pending" || pending))
-        badge = { cls: "run", label: "running", title: "CI running" };
+      if (failed) badge = { cls: "fail", label: "ko", title: "a CI check failed" };
+      else if (settledOk) badge = { cls: "pass", label: "ok", title: "all CI checks passing" };
+      else if (pending) badge = { cls: "run", label: "running", title: "CI running" };
       else badge = { cls: "unknown", label: "—", title: "no CI status" };
-      badge.running = pending && (ci.overall === "success" || ci.overall === "failure");
-      badge.checks = ci.checks;
+      badge.running = pending && (failed || settledOk);
+      badge.checks = checks;
       return badge;
     }
     // fallback: scraped runbot bundle status
+    const row = this.bundleRow(ws);
+    if (!row) return null;
     const s = this.code.runbot()[row.branch] || null;
     const result = (s && s.result) || "";
     const running = !!(s && s.running);
@@ -565,8 +582,7 @@ export class WorkspacesScreen extends Component {
   mbStatus(ws) {
     const rows = [];
     const RANK = { blocked: 0, progress: 1, ready: 2, merged: 3, other: 4 };
-    for (const row of this.wsRows(ws)) {
-      if (!row.pr || !row.github) continue;
+    for (const row of this.prRows(ws)) {
       const state = this.code.mergebot()[`${row.github}#${row.pr.number}`] || "";
       if (!state) continue;
       rows.push({
@@ -586,8 +602,11 @@ export class WorkspacesScreen extends Component {
     const branch = this.bundleBranch(ws);
     const scraped = branch && this.code.runbot()[branch]?.url;
     if (scraped) return scraped;
-    const checks = this.bundleRow(ws)?.pr?.ci?.checks || [];
-    return checks.find((c) => c.context === "ci/runbot")?.url || "";
+    for (const row of this.prRows(ws)) {
+      const url = (row.pr.ci?.checks || []).find((c) => c.context === "ci/runbot")?.url;
+      if (url) return url;
+    }
+    return "";
   }
 
   showCiMenu(ev, checks) {
@@ -653,14 +672,28 @@ export class WorkspacesScreen extends Component {
         title: "mergebot: " + mb.label,
       });
     }
-    if (!pills.length)
-      pills.push({
-        key: "none",
-        cls: "none",
-        sym: "",
-        label: "no PR",
-        title: "no pull request on this workspace's branch",
-      });
+    if (!pills.length) {
+      // nothing to report yet — but a freshly opened PR (no CI, not staged) is not
+      // the same as no PR at all, so say which one it is
+      const prs = this.prRows(ws);
+      pills.push(
+        prs.length
+          ? {
+              key: "pr",
+              cls: "none",
+              sym: "",
+              label: prs.length > 1 ? "PRs" : `#${prs[0].pr.number}`,
+              title: prs.map((r) => `${r.github}#${r.pr.number}`).join(", ") + " — no CI yet",
+            }
+          : {
+              key: "none",
+              cls: "none",
+              sym: "",
+              label: "no PR",
+              title: "no pull request on this workspace's branch",
+            },
+      );
+    }
     return pills;
   }
 
