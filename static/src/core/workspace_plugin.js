@@ -18,6 +18,19 @@ import { postJSON, worktreeDirFor, descendantWorkspaces } from "./utils.js";
 
 import { Plugin, usePlugin, signal } from "@odoo/owl";
 
+// the last selected workspace, remembered per browser so the Workspaces screen
+// reopens (and a page refresh lands) on what you were last working on. A browser
+// view preference like the list ordering — not server config.
+const SELECTED_KEY = "goo-workspace-selected";
+
+function savedSelection() {
+  try {
+    return localStorage.getItem(SELECTED_KEY) || "";
+  } catch {
+    return ""; // browser storage can be disabled; selection just won't persist
+  }
+}
+
 export class WorkspacePlugin extends Plugin {
   static sequence = 5;
 
@@ -27,7 +40,9 @@ export class WorkspacePlugin extends Plugin {
   code = usePlugin(CodePlugin);
   eventLog = usePlugin(EventLogPlugin);
   dialogs = usePlugin(DialogPlugin);
-  selectedId = signal(""); // the workspace selected in the Workspaces screen
+  // the workspace selected in the Workspaces screen, seeded from the previous
+  // session (the screen validates it still exists before honouring it)
+  selectedId = signal(savedSelection());
   requestedSelection = signal(""); // one-shot explicit target for the next screen open
   // one-shot: a detail pane the Workspaces screen should open on its next render
   // (set by the event log's [jump] — survives the screen not being mounted yet)
@@ -65,6 +80,12 @@ export class WorkspacePlugin extends Plugin {
 
   select(id) {
     this.selectedId.set(id);
+    try {
+      if (id) localStorage.setItem(SELECTED_KEY, id);
+      else localStorage.removeItem(SELECTED_KEY);
+    } catch {
+      /* storage disabled — the in-memory selection still works */
+    }
     // only worktree workspaces have a per-server tail to prime (a main-located
     // workspace's log is the shared main-server buffer)
     if (id && this.isWorktree((this.config.config.workspaces || []).find((w) => w.id === id)))
@@ -382,7 +403,8 @@ export class WorkspacePlugin extends Plugin {
     });
     this.store.dropServer(tgt.id);
     this.logs.delete(tgt.id);
-    if (this.selectedId() === tgt.id) this.selectedId.set("");
+    // through select() so the remembered selection is cleared too, not just the signal
+    if (this.selectedId() === tgt.id) this.select("");
     return true;
   }
 

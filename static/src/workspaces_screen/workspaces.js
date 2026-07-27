@@ -323,12 +323,13 @@ export class WorkspacesScreen extends Component {
     };
     onMounted(() => document.addEventListener("click", closeMenu));
     onWillUnmount(() => document.removeEventListener("click", closeMenu));
-    // An explicit cross-screen jump wins once; an ordinary return starts on the
-    // first workspace in the user's saved ordering rather than reviving the last
-    // selection from a previous visit.
+    // An explicit cross-screen jump wins once; otherwise resume the last selected
+    // workspace (remembered by WorkspacePlugin across screens and page reloads),
+    // falling back to the first in the user's saved ordering when it is gone —
+    // removed, or belonging to another browser profile's config.
     const requested = this.wt.requestedSelection();
-    const selected = requested && this.list.find((ws) => ws.id === requested);
-    const first = selected || this.list[0];
+    const inList = (id) => id && this.list.find((ws) => ws.id === id);
+    const first = inList(requested) || inList(this.wt.selectedId()) || this.list[0];
     if (first) this.wt.select(first.id);
     this.wt.requestedSelection.set("");
     // A jump can target Workspaces while this screen is already mounted (setting

@@ -3935,6 +3935,14 @@ var RouterPlugin = class extends Plugin {
 };
 
 // static/src/core/workspace_plugin.js
+var SELECTED_KEY = "goo-workspace-selected";
+function savedSelection() {
+  try {
+    return localStorage.getItem(SELECTED_KEY) || "";
+  } catch {
+    return "";
+  }
+}
 var WorkspacePlugin = class extends Plugin {
   static sequence = 5;
   config = usePlugin(ConfigPlugin);
@@ -3944,8 +3952,9 @@ var WorkspacePlugin = class extends Plugin {
   code = usePlugin(CodePlugin);
   eventLog = usePlugin(EventLogPlugin);
   dialogs = usePlugin(DialogPlugin);
-  selectedId = signal("");
-  // the workspace selected in the Workspaces screen
+  // the workspace selected in the Workspaces screen, seeded from the previous
+  // session (the screen validates it still exists before honouring it)
+  selectedId = signal(savedSelection());
   requestedSelection = signal("");
   // one-shot explicit target for the next screen open
   // one-shot: a detail pane the Workspaces screen should open on its next render
@@ -3979,6 +3988,11 @@ var WorkspacePlugin = class extends Plugin {
   }
   select(id) {
     this.selectedId.set(id);
+    try {
+      if (id) localStorage.setItem(SELECTED_KEY, id);
+      else localStorage.removeItem(SELECTED_KEY);
+    } catch {
+    }
     if (id && this.isWorktree((this.config.config.workspaces || []).find((w) => w.id === id)))
       this._primeLogs(id);
   }
@@ -4241,7 +4255,7 @@ var WorkspacePlugin = class extends Plugin {
     });
     this.store.dropServer(tgt.id);
     this.logs.delete(tgt.id);
-    if (this.selectedId() === tgt.id) this.selectedId.set("");
+    if (this.selectedId() === tgt.id) this.select("");
     return true;
   }
   async remove(tgt) {
@@ -12203,8 +12217,8 @@ var WorkspacesScreen = class extends Component {
     onMounted(() => document.addEventListener("click", closeMenu));
     onWillUnmount(() => document.removeEventListener("click", closeMenu));
     const requested = this.wt.requestedSelection();
-    const selected = requested && this.list.find((ws) => ws.id === requested);
-    const first = selected || this.list[0];
+    const inList = (id) => id && this.list.find((ws) => ws.id === id);
+    const first = inList(requested) || inList(this.wt.selectedId()) || this.list[0];
     if (first) this.wt.select(first.id);
     this.wt.requestedSelection.set("");
     useEffect(() => {
