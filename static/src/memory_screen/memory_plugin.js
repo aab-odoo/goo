@@ -36,7 +36,8 @@ export class MemoryPlugin extends Plugin {
 
   _saveBuilds(builds) {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(builds));
+      const persisted = builds.map(({ content: _content, ...rest }) => rest);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
     } catch {
       // storage full or unavailable
     }
@@ -58,7 +59,34 @@ export class MemoryPlugin extends Plugin {
   }
 
   updateBuild(idx, key, value) {
-    const next = this.builds().map((b, i) => (i === idx ? { ...b, [key]: value } : b));
+    const next = this.builds().map((b, i) => {
+      if (i !== idx) return b;
+      const updated = { ...b, [key]: value };
+      if (key === "url") {
+        delete updated.fileName;
+        delete updated.content;
+      }
+      return updated;
+    });
+    this.setBuilds(next);
+  }
+
+  // uploaded file content is transient (never written to localStorage — logs
+  // can be many MB, and a fresh upload is needed after reload anyway); typing
+  // a URL and picking a file are mutually exclusive for a given row.
+  setBuildFile(idx, fileName, content) {
+    const next = this.builds().map((b, i) =>
+      i === idx ? { ...b, url: "", fileName, content } : b,
+    );
+    this.setBuilds(next);
+  }
+
+  clearBuildFile(idx) {
+    const next = this.builds().map((b, i) => {
+      if (i !== idx) return b;
+      const { fileName: _fileName, content: _content, ...rest } = b;
+      return rest;
+    });
     this.setBuilds(next);
   }
 
@@ -82,7 +110,7 @@ export class MemoryPlugin extends Plugin {
         this.batchError.set("No builds found at that URL.");
       } else {
         // drop the trailing empty placeholder row if present, then append
-        const existing = this.builds().filter((b) => b.label.trim() || b.url.trim());
+        const existing = this.builds().filter((b) => b.label.trim() || b.url.trim() || b.content);
         this.setBuilds([...existing, ...res.builds]);
       }
     } catch (e) {
@@ -93,7 +121,7 @@ export class MemoryPlugin extends Plugin {
   }
 
   async load() {
-    const builds = this.builds().filter((b) => b.url.trim());
+    const builds = this.builds().filter((b) => b.url.trim() || b.content);
     if (!builds.length || this.loading()) return;
 
     this.loading.set(true);

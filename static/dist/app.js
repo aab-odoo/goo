@@ -7407,7 +7407,8 @@ var MemoryPlugin = class extends Plugin {
   }
   _saveBuilds(builds) {
     try {
-      localStorage.setItem(STORAGE_KEY2, JSON.stringify(builds));
+      const persisted = builds.map(({ content: _content, ...rest }) => rest);
+      localStorage.setItem(STORAGE_KEY2, JSON.stringify(persisted));
     } catch {
     }
   }
@@ -7424,7 +7425,32 @@ var MemoryPlugin = class extends Plugin {
     this.data.set([]);
   }
   updateBuild(idx, key, value) {
-    const next = this.builds().map((b, i) => i === idx ? { ...b, [key]: value } : b);
+    const next = this.builds().map((b, i) => {
+      if (i !== idx) return b;
+      const updated = { ...b, [key]: value };
+      if (key === "url") {
+        delete updated.fileName;
+        delete updated.content;
+      }
+      return updated;
+    });
+    this.setBuilds(next);
+  }
+  // uploaded file content is transient (never written to localStorage — logs
+  // can be many MB, and a fresh upload is needed after reload anyway); typing
+  // a URL and picking a file are mutually exclusive for a given row.
+  setBuildFile(idx, fileName, content) {
+    const next = this.builds().map(
+      (b, i) => i === idx ? { ...b, url: "", fileName, content } : b
+    );
+    this.setBuilds(next);
+  }
+  clearBuildFile(idx) {
+    const next = this.builds().map((b, i) => {
+      if (i !== idx) return b;
+      const { fileName: _fileName, content: _content, ...rest } = b;
+      return rest;
+    });
     this.setBuilds(next);
   }
   setBatchUrl(url) {
@@ -7444,7 +7470,7 @@ var MemoryPlugin = class extends Plugin {
       if (!res.builds || !res.builds.length) {
         this.batchError.set("No builds found at that URL.");
       } else {
-        const existing = this.builds().filter((b) => b.label.trim() || b.url.trim());
+        const existing = this.builds().filter((b) => b.label.trim() || b.url.trim() || b.content);
         this.setBuilds([...existing, ...res.builds]);
       }
     } catch (e) {
@@ -7454,7 +7480,7 @@ var MemoryPlugin = class extends Plugin {
     }
   }
   async load() {
-    const builds = this.builds().filter((b) => b.url.trim());
+    const builds = this.builds().filter((b) => b.url.trim() || b.content);
     if (!builds.length || this.loading()) return;
     this.loading.set(true);
     this.error.set("");
@@ -8169,8 +8195,18 @@ var MemoryScreen = class extends Component {
               <div class="mem-build-row" t-foreach="this.memory.builds()" t-as="b" t-key="b_index">
                 <input type="text" class="mem-label-input" placeholder="label (e.g. master)"
                        t-att-value="b.label" t-on-input="ev => this.memory.updateBuild(b_index, 'label', ev.target.value)"/>
-                <input type="text" class="mem-url-input" placeholder="log URL (e.g. https://runbot…/logs/test_only.txt)"
+                <input t-if="!b.fileName" type="text" class="mem-url-input" placeholder="log URL (e.g. https://runbot…/logs/test_only.txt)"
                        t-att-value="b.url" t-on-input="ev => this.memory.updateBuild(b_index, 'url', ev.target.value)"/>
+                <span t-if="b.fileName" class="mem-file-chip" t-att-class="{stale: !b.content}"
+                      t-att-title="b.content ? b.fileName : b.fileName + ' — content lost on reload, please re-upload'">
+                  <t t-out="b.fileName"/>
+                  <button type="button" class="mem-file-clear" title="Remove file" t-on-click="() => this.memory.clearBuildFile(b_index)">✕</button>
+                </span>
+                <label class="mem-upload-btn" title="Upload log file from disk">
+                  <t t-out="this.uploadIcon"/>
+                  <input type="file" class="mem-file-input" accept=".txt,.log,text/plain"
+                         t-on-change="ev => this.onFilePicked(b_index, ev)"/>
+                </label>
                 <button class="drop-btn" t-on-click="() => this.memory.removeBuild(b_index)">✕</button>
               </div>
               <button class="pbtn" t-on-click="() => this.addBuild()">Add build</button>
@@ -8179,7 +8215,7 @@ var MemoryScreen = class extends Component {
         </div>
         <div class="mem-chart-wrap">
           <div t-if="!this.memory.data().length &amp;&amp; !this.memory.loading() &amp;&amp; !this.memory.error()" class="dim mem-hint">
-            Enter one or more build log URLs on the left and click "Draw graph".
+            Enter build log URLs or upload log files on the left, then click "Draw graph".
           </div>
           <div t-if="this.memory.data().length" class="mem-chart-hint dim">Scroll to zoom · shift-drag to zoom a range · double-click to reset</div>
           <canvas t-ref="this.canvas" t-on-dblclick="() => this.resetZoom()"/>
@@ -8189,6 +8225,7 @@ var MemoryScreen = class extends Component {
   memory = usePlugin(MemoryPlugin);
   canvas = signal.ref(HTMLElement);
   chevronIcon = m(ICONS.chevron);
+  uploadIcon = m(ICONS.push);
   _chart = null;
   _focusRowIndex = -1;
   // index to focus on the next patch, once its DOM exists
@@ -8207,7 +8244,7 @@ var MemoryScreen = class extends Component {
     });
   }
   hasUrls() {
-    return this.memory.builds().some((b) => b.url.trim());
+    return this.memory.builds().some((b) => b.url.trim() || b.content);
   }
   toggleSidebar() {
     this.sidebarCollapsed.set(!this.sidebarCollapsed());
@@ -8218,13 +8255,21 @@ var MemoryScreen = class extends Component {
   }
   addBuild() {
     const builds = this.memory.builds();
-    const emptyIdx = builds.findIndex((b) => !b.label.trim() && !b.url.trim());
+    const emptyIdx = builds.findIndex((b) => !b.label.trim() && !b.url.trim() && !b.fileName);
     if (emptyIdx !== -1) {
       this._focusRow(emptyIdx);
       return;
     }
     this.memory.addBuild();
     this._focusRowIndex = builds.length;
+  }
+  onFilePicked(idx, ev) {
+    const file = ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => this.memory.setBuildFile(idx, file.name, reader.result);
+    reader.readAsText(file);
   }
   toggleMobile() {
     this.memory.withMobile.set(!this.memory.withMobile());

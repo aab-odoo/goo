@@ -44,8 +44,18 @@ export class MemoryScreen extends Component {
               <div class="mem-build-row" t-foreach="this.memory.builds()" t-as="b" t-key="b_index">
                 <input type="text" class="mem-label-input" placeholder="label (e.g. master)"
                        t-att-value="b.label" t-on-input="ev => this.memory.updateBuild(b_index, 'label', ev.target.value)"/>
-                <input type="text" class="mem-url-input" placeholder="log URL (e.g. https://runbot…/logs/test_only.txt)"
+                <input t-if="!b.fileName" type="text" class="mem-url-input" placeholder="log URL (e.g. https://runbot…/logs/test_only.txt)"
                        t-att-value="b.url" t-on-input="ev => this.memory.updateBuild(b_index, 'url', ev.target.value)"/>
+                <span t-if="b.fileName" class="mem-file-chip" t-att-class="{stale: !b.content}"
+                      t-att-title="b.content ? b.fileName : b.fileName + ' — content lost on reload, please re-upload'">
+                  <t t-out="b.fileName"/>
+                  <button type="button" class="mem-file-clear" title="Remove file" t-on-click="() => this.memory.clearBuildFile(b_index)">✕</button>
+                </span>
+                <label class="mem-upload-btn" title="Upload log file from disk">
+                  <t t-out="this.uploadIcon"/>
+                  <input type="file" class="mem-file-input" accept=".txt,.log,text/plain"
+                         t-on-change="ev => this.onFilePicked(b_index, ev)"/>
+                </label>
                 <button class="drop-btn" t-on-click="() => this.memory.removeBuild(b_index)">✕</button>
               </div>
               <button class="pbtn" t-on-click="() => this.addBuild()">Add build</button>
@@ -54,7 +64,7 @@ export class MemoryScreen extends Component {
         </div>
         <div class="mem-chart-wrap">
           <div t-if="!this.memory.data().length &amp;&amp; !this.memory.loading() &amp;&amp; !this.memory.error()" class="dim mem-hint">
-            Enter one or more build log URLs on the left and click "Draw graph".
+            Enter build log URLs or upload log files on the left, then click "Draw graph".
           </div>
           <div t-if="this.memory.data().length" class="mem-chart-hint dim">Scroll to zoom · shift-drag to zoom a range · double-click to reset</div>
           <canvas t-ref="this.canvas" t-on-dblclick="() => this.resetZoom()"/>
@@ -65,6 +75,7 @@ export class MemoryScreen extends Component {
   memory = usePlugin(MemoryPlugin);
   canvas = signal.ref(HTMLElement);
   chevronIcon = m(ICONS.chevron);
+  uploadIcon = m(ICONS.push);
   _chart = null;
   _focusRowIndex = -1; // index to focus on the next patch, once its DOM exists
   sidebarCollapsed = signal(false);
@@ -89,7 +100,7 @@ export class MemoryScreen extends Component {
   }
 
   hasUrls() {
-    return this.memory.builds().some((b) => b.url.trim());
+    return this.memory.builds().some((b) => b.url.trim() || b.content);
   }
 
   toggleSidebar() {
@@ -103,7 +114,7 @@ export class MemoryScreen extends Component {
 
   addBuild() {
     const builds = this.memory.builds();
-    const emptyIdx = builds.findIndex((b) => !b.label.trim() && !b.url.trim());
+    const emptyIdx = builds.findIndex((b) => !b.label.trim() && !b.url.trim() && !b.fileName);
     if (emptyIdx !== -1) {
       // an empty row already exists (e.g. the initial placeholder) — reuse it
       // instead of piling up another one; its DOM is already there, so focus now
@@ -112,6 +123,15 @@ export class MemoryScreen extends Component {
     }
     this.memory.addBuild();
     this._focusRowIndex = builds.length; // the new row lands right after the old ones
+  }
+
+  onFilePicked(idx, ev) {
+    const file = ev.target.files[0];
+    ev.target.value = ""; // allow re-picking the same file later
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => this.memory.setBuildFile(idx, file.name, reader.result);
+    reader.readAsText(file);
   }
 
   toggleMobile() {
