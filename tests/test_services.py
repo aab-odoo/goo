@@ -774,6 +774,36 @@ class NightlyServiceTest(unittest.TestCase):
         self.assertEqual(sum(1 for u in io.http_calls if "build/10" in u), 1)
 
 
+class MemoryServiceTest(unittest.TestCase):
+    def test_fetch_from_url(self):
+        log = "a.WebSuite.Something.js:  [MEMINFO] @suite.one (after GC) - used: 100\n"
+        io = FakeIO(http={"example.com": (log, None)})
+        svc = services.MemoryService(io)
+        rows = svc.fetch([{"label": "master", "url": "http://example.com/log.txt"}])
+        self.assertEqual(rows, [{"suite": "@suite.one", "master": 100}])
+
+    def test_fetch_from_uploaded_content_skips_http(self):
+        log = "a.WebSuite.Something.js:  [MEMINFO] @suite.one (after GC) - used: 200\n"
+        io = FakeIO()
+        svc = services.MemoryService(io)
+        rows = svc.fetch([{"label": "local", "content": log}])
+        self.assertEqual(rows, [{"suite": "@suite.one", "local": 200}])
+        self.assertEqual(io.http_calls, [])
+
+    def test_fetch_mixes_url_and_uploaded_builds(self):
+        url_log = "a.WebSuite.Something.js:  [MEMINFO] @suite.one (after GC) - used: 100\n"
+        file_log = "a.WebSuite.Something.js:  [MEMINFO] @suite.one (after GC) - used: 300\n"
+        io = FakeIO(http={"example.com": (url_log, None)})
+        svc = services.MemoryService(io)
+        rows = svc.fetch(
+            [
+                {"label": "master", "url": "http://example.com/log.txt"},
+                {"label": "uploaded", "content": file_log},
+            ]
+        )
+        self.assertEqual(rows, [{"suite": "@suite.one", "master": 100, "uploaded": 300}])
+
+
 class GitHubServiceTest(unittest.TestCase):
     def test_prs_maps_ci_rollup(self):
         payload = (

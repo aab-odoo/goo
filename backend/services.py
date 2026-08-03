@@ -1367,17 +1367,21 @@ class MemoryService:
 
     def fetch(self, builds, with_mobile=False):
         """[{suite, <label>: bytes, ...}] — one row per suite, one column per
-        build — for a list of {"label", "url"} builds, fetched in parallel."""
-        valid = [b for b in builds if b.get("url")]
+        build — for a list of {"label", "url"} builds fetched in parallel, or
+        {"label", "content"} builds (a log uploaded from disk) parsed directly."""
+        to_fetch = [b for b in builds if b.get("url") and not b.get("content")]
 
         def fetch_one(build):
             html, err = self.io.http_get(build["url"], timeout=60)
             return build.get("label", ""), ([] if err else self.parse_log(html))
 
         per_build = {}
-        if valid:
-            with ThreadPoolExecutor(max_workers=min(16, len(valid))) as pool:
-                per_build = dict(pool.map(fetch_one, valid))
+        if to_fetch:
+            with ThreadPoolExecutor(max_workers=min(16, len(to_fetch))) as pool:
+                per_build = dict(pool.map(fetch_one, to_fetch))
+        for b in builds:
+            if b.get("content"):
+                per_build[b.get("label", "")] = self.parse_log(b["content"])
 
         rows, seen = [], {}
         for build in builds:
