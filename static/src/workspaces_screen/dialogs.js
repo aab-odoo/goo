@@ -467,19 +467,58 @@ export function findSubWorkspace(config, parentWs, row) {
   );
 }
 
+// Resolve + fetch each {repo, pull: {github, number}} target's real head branch
+// (via /api/prs/head — a PR's head isn't always the bare branch name a caller
+// already knows, e.g. a forward-port's is fw-bot's `<target>-<source>-<n>-fw`),
+// refresh the affected repos' local branch state, and report any per-repo
+// failures. A repo whose branch doesn't exist upstream yet just fails its own
+// fetch — the flow proceeds with whichever succeeded. Returns the successfully-
+// fetched {repo, branch} entries, or null if every target failed.
+async function resolvePrBranches(plugins, targets) {
+  const { code, dialogs, eventLog } = plugins;
+  const results = await Promise.all(
+    targets.map(async ({ repo, pull }) => {
+      const eid = eventLog.begin(`fetching PR #${pull.number} (${repo.id})`);
+      try {
+        const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
+        const branch = head.branch;
+        if (!branch) throw new Error("could not resolve the PR's head branch");
+        await postJSON("/api/code/remote-branch/fetch", {
+          path: repo.path,
+          branch,
+          pull_remote: repo.push_remote || "dev",
+        });
+        eventLog.finish(eid, "done");
+        return { repo, branch, ok: true };
+      } catch (e) {
+        eventLog.finish(eid, "error");
+        return { repo, ok: false, error: e.message };
+      }
+    }),
+  );
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length) {
+    dialogs.error(
+      "Fetching PR branch failed",
+      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n"),
+    );
+  }
+  const got = results.filter((r) => r.ok);
+  if (!got.length) return null;
+  await code.refreshBranches(new Set(got.map((g) => g.repo.id)));
+  return got;
+}
+
 // Create a sub-workspace for one forward-port row: fetch the row's branch across every
 // repo the row lists (resolved from each cell's github slug → a configured repo, matched
 // against ALL configured repos, not just parentWs's own checkouts — a forward-port row
 // can name a repo the parent workspace doesn't itself check out), then open the
-// prefilled create form with `parent` set to the spawning workspace's id. A repo whose
-// branch doesn't exist upstream yet (a "waiting" row) just fails its own fetch — errors
-// are reported per-repo and the flow proceeds with whichever succeeded, aborting only
-// if every fetch failed (same pattern as startNewWorkspaceWizard's bundle path). If a
+// prefilled create form with `parent` set to the spawning workspace's id. If a
 // sub-workspace was already created for this row, this just opens it instead.
 // plugins: { config, dialogs, db, code, eventLog, wt }. parentWs: the workspace (plain
 // blob) the button was clicked from. row: a forwardPortChains row — { branch, cells }.
 export async function createSubWorkspaceFromForwardPort(plugins, parentWs, row) {
-  const { config, dialogs, code, eventLog, wt } = plugins;
+  const { config, dialogs, wt } = plugins;
   const existing = findSubWorkspace(config, parentWs, row);
   if (existing) {
     wt.select(existing.id);
@@ -507,41 +546,8 @@ export async function createSubWorkspaceFromForwardPort(plugins, parentWs, row) 
       cancelLabel: null,
     });
   }
-  // Each cell's PR head is fw-bot's real branch (master-…-fw), which the matrix
-  // doesn't carry — resolve it per PR, then fetch it from the push remote (the dev
-  // fork the fw branches live on). Fetching from there — not origin's pull/<n>/head —
-  // also writes the refs/remotes/<dev>/<branch> tracking ref, so the checkout counts
-  // as pushed and goo re-detects the PR by its head branch.
-  const results = await Promise.all(
-    targets.map(async ({ repo, pull }) => {
-      const eid = eventLog.begin(`fetching forward-port #${pull.number} (${repo.id})`);
-      try {
-        const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
-        const branch = head.branch;
-        if (!branch) throw new Error("could not resolve the PR's head branch");
-        await postJSON("/api/code/remote-branch/fetch", {
-          path: repo.path,
-          branch,
-          pull_remote: repo.push_remote || "dev",
-        });
-        eventLog.finish(eid, "done");
-        return { repo, branch, ok: true };
-      } catch (e) {
-        eventLog.finish(eid, "error");
-        return { repo, ok: false, error: e.message };
-      }
-    }),
-  );
-  const failed = results.filter((r) => !r.ok);
-  if (failed.length) {
-    dialogs.error(
-      "Fetching forward-port branch failed",
-      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n"),
-    );
-    if (failed.length === results.length) return;
-  }
-  const got = results.filter((r) => r.ok);
-  await code.refreshBranches(new Set(got.map((g) => g.repo.id)));
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
   const name = got[0].branch; // the fw branch — unambiguous; editable in the form
   return startCreateWorkspace(plugins, {
     name,
@@ -551,6 +557,25 @@ export async function createSubWorkspaceFromForwardPort(plugins, parentWs, row) 
     createBranches: false,
     parent: parentWs.id,
     category: parentWs.category || "",
+  });
+}
+
+// Create a fresh (non-sub) workspace directly from one or more tracked review
+// PRs that share a branch name across repos — the same cross-repo convention a
+// "task" groups by in the Reviews screen — so the resolved checkouts are exactly
+// that task's linked branches. Same branch-resolution dance as a forward-port
+// sub-workspace, minus the parent: this always creates a new top-level workspace.
+// targets: [{repo, pull: {github, number}}], one per repo the task spans.
+export async function createWorkspaceFromPRs(plugins, targets) {
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
+  const name = got[0].branch;
+  return startCreateWorkspace(plugins, {
+    name,
+    config: repoBranchList.format(got.map((g) => ({ repo: g.repo.id, branch: g.branch }))),
+    db: name,
+    template: "",
+    createBranches: false,
   });
 }
 

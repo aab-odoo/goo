@@ -20,6 +20,7 @@ import { ClaudePlugin } from "./workspaces_screen/claude_plugin.js";
 import { NightlyPlugin } from "./nightly_screen/nightly_plugin.js";
 import { MemoryPlugin } from "./memory_screen/memory_plugin.js";
 import { CiPlugin } from "./ci_screen/ci_plugin.js";
+import { ReviewsPlugin } from "./reviews_screen/reviews_plugin.js";
 
 const PLUGINS = [
   StorePlugin,
@@ -40,6 +41,7 @@ const PLUGINS = [
   NightlyPlugin,
   MemoryPlugin,
   CiPlugin,
+  ReviewsPlugin,
 ];
 
 async function boot() {

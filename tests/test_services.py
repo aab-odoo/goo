@@ -926,6 +926,112 @@ class GitHubServiceTest(unittest.TestCase):
         svc = services.GitHubService(io, TTLCache(ttl=600))
         self.assertEqual(svc.pr_head("odoo/odoo", 1), ("", "no pull requests found"))
 
+    def test_pr_infos_maps_ci_rollup_and_dedups(self):
+        payload = (
+            '{"number": 279751, "title": "t", "url": "u", "state": "MERGED", "isDraft": false,'
+            ' "headRefName": "br", "createdAt": "a", "updatedAt": "b", "statusCheckRollup": ['
+            '{"context": "ci/runbot", "state": "SUCCESS", "targetUrl": "ru"}]}'
+        )
+        io = FakeIO(run_result=completed(stdout=payload))
+        svc = services.GitHubService(io, TTLCache(ttl=600))
+        pairs = [
+            {"github": "odoo/odoo", "number": 279751},
+            {"github": "odoo/odoo", "number": 279751},  # duplicate — one gh call
+        ]
+        prs = svc.pr_infos(pairs)
+        self.assertEqual(len(prs), 1)
+        pr = prs[0]
+        self.assertEqual(pr["relation"], "tracked")
+        self.assertEqual(pr["state"], "merged")
+        self.assertEqual(pr["branch"], "br")
+        self.assertEqual(pr["ci"]["runbot"], "success")
+        self.assertEqual(
+            io.run_calls,
+            [
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    "279751",
+                    "--repo",
+                    "odoo/odoo",
+                    "--json",
+                    "number,title,url,state,isDraft,headRefName,createdAt,updatedAt,statusCheckRollup",
+                ]
+            ],
+        )
+
+    def test_pr_infos_omits_unresolvable_pairs(self):
+        io = FakeIO(run_result=completed(returncode=1, stderr="not found"))
+        svc = services.GitHubService(io, TTLCache(ttl=0))
+        self.assertEqual(svc.pr_infos([{"github": "odoo/odoo", "number": 1}]), [])
+
+    def test_review_statuses_reviewed_when_review_after_last_request(self):
+        # GitHub's own "current reviewRequests" doesn't clear on a plain Comment
+        # review (only Approve/Request-changes) — the real signal is whether the
+        # user's last review is more recent than their last review-request event
+        io = FakeIO(
+            runs={
+                "gh api user": completed(stdout="aab"),
+                "gh pr view": completed(
+                    stdout='{"reviews": [{"author": {"login": "aab"},'
+                    ' "submittedAt": "2026-01-02T00:00:00Z"}]}'
+                ),
+                "timeline": completed(stdout='{"login": "aab", "at": "2026-01-01T00:00:00Z"}\n'),
+            },
+        )
+        svc = services.GitHubService(io, TTLCache(ttl=600))
+        statuses = svc.review_statuses([{"github": "odoo/odoo", "number": 1}])
+        self.assertEqual(statuses, {"odoo/odoo#1": "reviewed"})
+
+    def test_review_statuses_to_review_when_re_requested_after_review(self):
+        io = FakeIO(
+            runs={
+                "gh api user": completed(stdout="aab"),
+                "gh pr view": completed(
+                    stdout='{"reviews": [{"author": {"login": "aab"},'
+                    ' "submittedAt": "2026-01-01T00:00:00Z"}]}'
+                ),
+                "timeline": completed(stdout='{"login": "aab", "at": "2026-01-02T00:00:00Z"}\n'),
+            }
+        )
+        svc = services.GitHubService(io, TTLCache(ttl=600))
+        statuses = svc.review_statuses([{"github": "odoo/odoo", "number": 1}])
+        self.assertEqual(statuses, {"odoo/odoo#1": "to_review"})
+
+    def test_review_statuses_to_review_when_never_reviewed(self):
+        io = FakeIO(
+            runs={
+                "gh api user": completed(stdout="aab"),
+                "gh pr view": completed(stdout='{"reviews": []}'),
+            }
+        )
+        svc = services.GitHubService(io, TTLCache(ttl=600))
+        statuses = svc.review_statuses([{"github": "odoo/odoo", "number": 1}])
+        self.assertEqual(statuses, {"odoo/odoo#1": "to_review"})
+        # never reviewed → no need to even check the request timeline
+        self.assertFalse(any("timeline" in " ".join(c) for c in io.run_calls))
+        # "me" is resolved once and cached for the service's lifetime
+        svc.review_statuses([{"github": "odoo/odoo", "number": 2}])
+        self.assertEqual(sum(1 for c in io.run_calls if "user" in c), 1)
+
+    def test_review_statuses_to_review_when_only_review_is_a_pending_draft(self):
+        # a PENDING (not-yet-submitted) review comes back with "submittedAt": null
+        # — a present-but-null key, so a plain .get(key, default) wouldn't catch it
+        # and a bare max() over [None] used to blow up comparing it to a string
+        io = FakeIO(
+            runs={
+                "gh api user": completed(stdout="aab"),
+                "gh pr view": completed(
+                    stdout='{"reviews": [{"author": {"login": "aab"}, "submittedAt": null}]}'
+                ),
+                "timeline": completed(stdout='{"login": "aab", "at": "2026-01-01T00:00:00Z"}\n'),
+            }
+        )
+        svc = services.GitHubService(io, TTLCache(ttl=600))
+        statuses = svc.review_statuses([{"github": "odoo/odoo", "number": 1}])
+        self.assertEqual(statuses, {"odoo/odoo#1": "to_review"})
+
     def test_ready_pr_marks_ready_through_gh(self):
         io = FakeIO(run_result=completed())
         svc = services.GitHubService(io, TTLCache(ttl=600))

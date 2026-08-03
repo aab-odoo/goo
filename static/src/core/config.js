@@ -102,6 +102,9 @@ export const DEFAULT_CONFIG = {
   // them from the default `targets` above.
   workspaces: [],
   templates: [],
+  // PRs tracked for review — someone else's PR you need to review/r+/follow up
+  // on until merged. Each entry is { id: "<github>#<number>", github, number }.
+  reviews: [],
   start: {
     repos: ["community"],
     db: "test_db",
@@ -125,6 +128,7 @@ export const DEFAULT_CONFIG = {
 export const SECTIONS = [
   "workspaces",
   "branches",
+  "review-queue",
   "todo",
   "databases",
   "nightly",

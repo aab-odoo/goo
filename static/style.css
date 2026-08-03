@@ -2838,6 +2838,76 @@ tr.active td.brg-commit {
 .runbot-paren {
   color: var(--l-text-faint);
 }
+
+/* ── Reviews screen ─────────────────────────────────────────────────────── */
+.rev-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rev-add input {
+  min-width: 260px;
+  font-size: 12.5px;
+  color: var(--l-text);
+  background: var(--l-card);
+  border: 1px solid var(--l-panel-line);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.rev-add-note {
+  font-size: 12px;
+}
+.rev-pr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.rev-pr-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: clamp(180px, 30vw, 520px);
+}
+.rev-fwports {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.rev-fwports button.dash-pr-state {
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+/* task "important" flag: a fixed-color hazard triangle (see ICONS.warning),
+   hidden until the task row is hovered; once toggled on, it stays fully
+   visible so a flagged task is never easy to miss even when the pointer's
+   elsewhere. */
+.rev-important {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.rev-important svg {
+  width: 18px;
+  height: 18px;
+}
+.rl-table tbody tr.rl-group-head:hover .rev-important {
+  opacity: 1;
+}
+.rev-important:hover {
+  background: var(--l-panel);
+}
+.rev-important.on {
+  opacity: 1;
+}
 .runbot-link {
   color: var(--l-accent);
 }

@@ -70,7 +70,14 @@ const SETTINGS_BOOLS = [
   "rust_bundler",
   "workspace_categories_enabled",
 ];
-const SETTINGS_JSON = ["start", "tabs", "links", "test_presets", "workspace_categories"];
+const SETTINGS_JSON = [
+  "start",
+  "tabs",
+  "links",
+  "test_presets",
+  "workspace_categories",
+  "reviews",
+];
 // the app-state blob keys (were the scattered oo-* localStorage keys, see config_plugin)
 const STATE_CHARS = ["active_workspace", "claude_model"];
 const STATE_JSON = ["test_history"];
@@ -94,6 +101,7 @@ export class Settings extends Model {
   links = fields.json();
   test_presets = fields.json();
   workspace_categories = fields.json(); // [{ id }] — group order for the Workspaces list
+  reviews = fields.json(); // [{ id, github, number, important? }] — the Reviews screen's tracked PRs
 }
 
 export class Repository extends Model {
@@ -455,6 +463,7 @@ export function toModels(orm, config = {}, state = {}) {
   settings.links = config.links ?? [];
   settings.test_presets = config.test_presets ?? [];
   settings.workspace_categories = config.workspace_categories ?? [];
+  settings.reviews = config.reviews ?? [];
   orm.create(Settings, settings);
 
   for (const r of config.repos || []) createRepo(orm, r);
@@ -566,6 +575,7 @@ export function toConfig(orm) {
     out.links = s.links() ?? [];
     out.test_presets = s.test_presets() ?? [];
     out.workspace_categories = s.workspace_categories() ?? [];
+    out.reviews = s.reviews() ?? [];
   }
   out.repos = orm.records(Repository).map((r) => blobFromRecord(REPO_FIELDS, r));
   out.workspaces = orm.records(Workspace).map((w) => ({
