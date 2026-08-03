@@ -93,6 +93,7 @@ class GitHubService:
     def __init__(self, io, cache):
         self.io = io
         self.cache = cache
+        self._login = None
 
     def prs(self, repos, refresh=False):
         """For each repo {id, github}: the user's PRs (all states). Cached per
@@ -235,6 +236,182 @@ class GitHubService:
                 ci=_ci_rollup(pr.get("statusCheckRollup")),
             )
         )
+
+    def pr_infos(self, pairs, refresh=False):
+        """Full PR info (title, url, state, ci, ...) for explicit {github, number}
+        pairs — e.g. a user-curated watchlist, regardless of author. Cached per
+        (github, number); refresh=True bypasses it. Returns a list of PullRequest
+        dicts (relation="tracked"), skipping pairs `gh` couldn't resolve."""
+        uniq = self._uniq_pairs(pairs)
+        if not uniq:
+            return []
+        if refresh:
+            for gh_repo, number in uniq:
+                self.cache.invalidate(("info", gh_repo, number))
+        with ThreadPoolExecutor(max_workers=min(8, len(uniq))) as pool:
+            results = pool.map(
+                lambda gn: self.cache.get(
+                    ("info", gn[0], gn[1]), lambda gn=gn: self._fetch_info(*gn)
+                ),
+                uniq,
+            )
+        return [pr for pr in results if pr]
+
+    def _fetch_info(self, gh_repo, number):
+        """A single PR's full info by number, regardless of author. Returns a
+        PullRequest dict, or None if `gh` couldn't resolve it."""
+        self.io.log_request(f"gh pr view {number} --repo {gh_repo}")
+        try:
+            r = self.io.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    str(number),
+                    "--repo",
+                    gh_repo,
+                    "--json",
+                    "number,title,url,state,isDraft,headRefName,createdAt,updatedAt,statusCheckRollup",
+                ],
+                timeout=30,
+            )
+            if r.returncode != 0:
+                return None
+            pr = json.loads(r.stdout)
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
+        return asdict(
+            PullRequest(
+                github=gh_repo,
+                number=pr.get("number"),
+                title=pr.get("title", ""),
+                url=pr.get("url", ""),
+                state=(pr.get("state") or "").lower(),
+                branch=pr.get("headRefName", ""),
+                relation="tracked",
+                draft=pr.get("isDraft", False),
+                created_at=pr.get("createdAt", ""),
+                updated_at=pr.get("updatedAt", ""),
+                ci=_ci_rollup(pr.get("statusCheckRollup")),
+            )
+        )
+
+    def review_statuses(self, pairs, refresh=False):
+        """For each {github, number}: "reviewed" if the authenticated user has
+        submitted a review on it and isn't currently in the pending
+        review-request list (i.e. hasn't been re-asked since), else
+        "to_review". Who r+'d it doesn't matter here — that's mergebot's own
+        state, not this. Cached per (github, number); refresh=True bypasses it.
+        Returns {"github#number": status}."""
+        uniq = self._uniq_pairs(pairs)
+        if not uniq:
+            return {}
+        if refresh:
+            for gh_repo, number in uniq:
+                self.cache.invalidate(("review", gh_repo, number))
+        with ThreadPoolExecutor(max_workers=min(8, len(uniq))) as pool:
+            statuses = pool.map(
+                lambda gn: self.cache.get(
+                    ("review", gn[0], gn[1]), lambda gn=gn: self._fetch_review_status(*gn)
+                ),
+                uniq,
+            )
+        return {
+            f"{gh_repo}#{number}": s for (gh_repo, number), s in zip(uniq, statuses, strict=True)
+        }
+
+    def _fetch_review_status(self, gh_repo, number):
+        """ "reviewed" if the authenticated user has submitted a review (any state
+        — Odoo reviewers mostly leave plain "Comment" reviews, never GitHub's
+        formal Approve/Request-changes) more recently than the last time they
+        were (re-)requested, else "to_review". Comparing timestamps — not
+        GitHub's "current reviewRequests" list — matters here: GitHub only
+        drops a user from that list on an Approve/Request-changes review, so
+        for a Comment-only review it stays there forever and would otherwise
+        always look "still requested"."""
+        login = self._me()
+        if not login:
+            return "to_review"
+        self.io.log_request(f"gh pr view {number} --repo {gh_repo} --json reviews")
+        try:
+            r = self.io.run(
+                ["gh", "pr", "view", str(number), "--repo", gh_repo, "--json", "reviews"],
+                timeout=30,
+            )
+            if r.returncode != 0:
+                return "to_review"
+            data = json.loads(r.stdout)
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return "to_review"
+        my_reviews = [
+            rev.get("submittedAt") or ""
+            for rev in data.get("reviews") or []
+            if (rev.get("author") or {}).get("login") == login
+        ]
+        if not my_reviews:
+            return "to_review"
+        last_review_at = max(my_reviews)
+        last_request_at = self._last_review_request(gh_repo, number, login)
+        return "to_review" if last_request_at > last_review_at else "reviewed"
+
+    def _last_review_request(self, gh_repo, number, login):
+        """The most recent time `login` was requested to review this PR (ISO
+        timestamp, "" if never/unknown) — from the issue timeline, since a
+        PR's current `reviewRequests` doesn't carry timing and (per above)
+        often doesn't clear at all. Never raises; "" on any failure just means
+        "no re-request found", the safe default (favors "reviewed")."""
+        self.io.log_request(f"gh api repos/{gh_repo}/issues/{number}/timeline --paginate")
+        try:
+            r = self.io.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{gh_repo}/issues/{number}/timeline",
+                    "--paginate",
+                    "--jq",
+                    '.[] | select(.event=="review_requested") '
+                    '| {login: (.requested_reviewer.login // ""), at: .created_at}',
+                ],
+                timeout=30,
+            )
+            if r.returncode != 0:
+                return ""
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+        at_times = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("login") == login and obj.get("at"):
+                at_times.append(obj["at"])
+        return max(at_times) if at_times else ""
+
+    def _me(self):
+        """The authenticated `gh` user's login, cached for the service's lifetime."""
+        if self._login is None:
+            self.io.log_request("gh api user --jq .login")
+            try:
+                r = self.io.run(["gh", "api", "user", "--jq", ".login"], timeout=15)
+                self._login = r.stdout.strip() if r.returncode == 0 else ""
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                self._login = ""
+        return self._login
+
+    @staticmethod
+    def _uniq_pairs(pairs):
+        seen, uniq = set(), []
+        for p in pairs:
+            gh_repo, number = p.get("github"), p.get("number")
+            if not (gh_repo and number) or (gh_repo, number) in seen:
+                continue
+            seen.add((gh_repo, number))
+            uniq.append((gh_repo, number))
+        return uniq
 
     def close_pr(self, github, number):
         """Close a GitHub PR. Returns (ok, error); invalidates the PR cache on

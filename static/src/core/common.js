@@ -29,6 +29,18 @@ export function mbCategory(s) {
   return "other";
 }
 
+// has mergebot acknowledged an r+ that hasn't since been invalidated? Doesn't
+// matter who posted it. NOT simply "state isn't blocked": mergebot's aggregate
+// state is the WORST unmet requirement (e.g. a PR can be r+'d and still show
+// "blocked" because CI hasn't passed yet) — so check the "Review" requirement
+// itself, via `details` (MergebotService._blocked_reasons — the comma-joined
+// list of what's currently unmet, e.g. "CI" or "Review, CI"), not the badge word.
+export function mbIsRPlus(state, details) {
+  if (!state) return false;
+  if (state === "merged") return true;
+  return !/review/i.test(details || "");
+}
+
 export const ICONS = {
   refresh: `<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.6 4"/><polyline points="20 4 20 11 13 11"/></svg>`,
   clear: `<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 13h10l1-13"/></svg>`,
@@ -64,6 +76,10 @@ export const ICONS = {
   nightly: `<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`,
   memory: `<svg viewBox="0 0 24 24"><polyline points="2 17 6 11 10 13 14 7 18 10 22 4"/><polyline points="22 4 22 9 17 9"/></svg>`,
   ci: `<svg viewBox="0 0 24 24"><path d="M3 12h4l2 5 3-11 2.5 8 1.5-4h5"/></svg>`,
+  eye: `<svg viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none"/></svg>`,
+  // a fixed-color hazard triangle (not currentColor) — it should read as "yellow
+  // warning sign" regardless of hover/active state, so only its opacity toggles
+  warning: `<svg viewBox="0 0 24 24"><path d="M12 3 22.5 20.5H1.5Z" fill="#f5c518" stroke="#c8960a" stroke-width="0.6" stroke-linejoin="round"/><rect x="11.1" y="9.5" width="1.8" height="5.5" rx="0.9" fill="#1f1f1f"/><circle cx="12" cy="17" r="1.05" fill="#1f1f1f"/></svg>`,
   // sidebar collapse/expand toggle: a double chevron (points left; CSS flips it
   // when collapsed so it points right = "expand")
   collapse: `<svg viewBox="0 0 24 24"><polyline points="13 17 8 12 13 7"/><polyline points="18 17 13 12 18 7"/></svg>`,
@@ -72,6 +88,11 @@ export const ICONS = {
 export const NAV = [
   { id: "workspaces", label: "Workspaces", icon: ICONS.worktree },
   { id: "branches", label: "Branches & PRs", icon: ICONS.branches },
+  // NOTE: the route id is "review-queue", not "reviews" — router_plugin.js's
+  // ALIASES already redirects the retired "reviews" hash (old PR-review
+  // feature) to "branches", so reusing that id here would silently bounce
+  // this screen back to Branches & PRs.
+  { id: "review-queue", label: "Reviews", icon: ICONS.eye, optIn: true },
   { id: "todo", label: "Todo", icon: ICONS.todo, optIn: true },
   { id: "databases", label: "Databases", icon: ICONS.databases },
   { id: "nightly", label: "Nightly", icon: ICONS.nightly, optIn: true },

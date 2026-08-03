@@ -124,6 +124,9 @@ var DEFAULT_CONFIG = {
   // them from the default `targets` above.
   workspaces: [],
   templates: [],
+  // PRs tracked for review — someone else's PR you need to review/r+/follow up
+  // on until merged. Each entry is { id: "<github>#<number>", github, number }.
+  reviews: [],
   start: {
     repos: ["community"],
     db: "test_db",
@@ -146,6 +149,7 @@ var DEFAULT_CONFIG = {
 var SECTIONS = [
   "workspaces",
   "branches",
+  "review-queue",
   "todo",
   "databases",
   "nightly",
@@ -2986,7 +2990,14 @@ var SETTINGS_BOOLS = [
   "rust_bundler",
   "workspace_categories_enabled"
 ];
-var SETTINGS_JSON = ["start", "tabs", "links", "test_presets", "workspace_categories"];
+var SETTINGS_JSON = [
+  "start",
+  "tabs",
+  "links",
+  "test_presets",
+  "workspace_categories",
+  "reviews"
+];
 var STATE_CHARS = ["active_workspace", "claude_model"];
 var STATE_JSON = ["test_history"];
 var Settings = class extends Model {
@@ -3010,6 +3021,8 @@ var Settings = class extends Model {
   test_presets = fields.json();
   workspace_categories = fields.json();
   // [{ id }] — group order for the Workspaces list
+  reviews = fields.json();
+  // [{ id, github, number, important? }] — the Reviews screen's tracked PRs
 };
 var Repository = class extends Model {
   static id = "repository";
@@ -3306,6 +3319,7 @@ function toModels(orm, config = {}, state = {}) {
   settings.links = config.links ?? [];
   settings.test_presets = config.test_presets ?? [];
   settings.workspace_categories = config.workspace_categories ?? [];
+  settings.reviews = config.reviews ?? [];
   orm.create(Settings, settings);
   for (const r of config.repos || []) createRepo(orm, r);
   for (const w of config.workspaces || []) createWorkspace(orm, w);
@@ -3395,6 +3409,7 @@ function toConfig(orm) {
     out.links = s.links() ?? [];
     out.test_presets = s.test_presets() ?? [];
     out.workspace_categories = s.workspace_categories() ?? [];
+    out.reviews = s.reviews() ?? [];
   }
   out.repos = orm.records(Repository).map((r) => blobFromRecord(REPO_FIELDS, r));
   out.workspaces = orm.records(Workspace).map((w) => ({
@@ -4468,6 +4483,11 @@ function mbCategory(s) {
   if (["blocked", "error"].includes(s)) return "blocked";
   return "other";
 }
+function mbIsRPlus(state, details) {
+  if (!state) return false;
+  if (state === "merged") return true;
+  return !/review/i.test(details || "");
+}
 var ICONS = {
   refresh: `<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.6 4"/><polyline points="20 4 20 11 13 11"/></svg>`,
   clear: `<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 13h10l1-13"/></svg>`,
@@ -4503,6 +4523,10 @@ var ICONS = {
   nightly: `<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`,
   memory: `<svg viewBox="0 0 24 24"><polyline points="2 17 6 11 10 13 14 7 18 10 22 4"/><polyline points="22 4 22 9 17 9"/></svg>`,
   ci: `<svg viewBox="0 0 24 24"><path d="M3 12h4l2 5 3-11 2.5 8 1.5-4h5"/></svg>`,
+  eye: `<svg viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none"/></svg>`,
+  // a fixed-color hazard triangle (not currentColor) — it should read as "yellow
+  // warning sign" regardless of hover/active state, so only its opacity toggles
+  warning: `<svg viewBox="0 0 24 24"><path d="M12 3 22.5 20.5H1.5Z" fill="#f5c518" stroke="#c8960a" stroke-width="0.6" stroke-linejoin="round"/><rect x="11.1" y="9.5" width="1.8" height="5.5" rx="0.9" fill="#1f1f1f"/><circle cx="12" cy="17" r="1.05" fill="#1f1f1f"/></svg>`,
   // sidebar collapse/expand toggle: a double chevron (points left; CSS flips it
   // when collapsed so it points right = "expand")
   collapse: `<svg viewBox="0 0 24 24"><polyline points="13 17 8 12 13 7"/><polyline points="18 17 13 12 18 7"/></svg>`
@@ -4510,6 +4534,11 @@ var ICONS = {
 var NAV = [
   { id: "workspaces", label: "Workspaces", icon: ICONS.worktree },
   { id: "branches", label: "Branches & PRs", icon: ICONS.branches },
+  // NOTE: the route id is "review-queue", not "reviews" — router_plugin.js's
+  // ALIASES already redirects the retired "reviews" hash (old PR-review
+  // feature) to "branches", so reusing that id here would silently bounce
+  // this screen back to Branches & PRs.
+  { id: "review-queue", label: "Reviews", icon: ICONS.eye, optIn: true },
   { id: "todo", label: "Todo", icon: ICONS.todo, optIn: true },
   { id: "databases", label: "Databases", icon: ICONS.databases },
   { id: "nightly", label: "Nightly", icon: ICONS.nightly, optIn: true },
@@ -8657,6 +8686,1205 @@ var CiScreen = class extends Component {
   }
 };
 
+// static/src/reviews_screen/reviews_plugin.js
+var ReviewsPlugin = class extends Plugin {
+  static sequence = 4;
+  prInfo = signal({});
+  // "github#number" -> PullRequest dict
+  reviewStatus = signal({});
+  // "github#number" -> "reviewed" | "to_review"
+  loading = signal(false);
+  error = signal("");
+  at = signal(0);
+  // last successful prInfo fetch (drives the screen's "updated…" stamp)
+  _pending = /* @__PURE__ */ new Set();
+  // in-flight keys, so overlapping effects don't double-fetch
+  // full PR info (title/url/state/ci/...) for tracked pairs not already held.
+  // force=true re-asks everything and bypasses the server cache (manual refresh).
+  async loadPrInfo(pairs, force = false) {
+    const have = this.prInfo();
+    const todo = (pairs || []).filter((p) => {
+      const k = `${p.github}#${p.number}`;
+      return (force || !(k in have)) && !this._pending.has(k);
+    });
+    if (!todo.length) return;
+    const keys = todo.map((p) => `${p.github}#${p.number}`);
+    keys.forEach((k) => this._pending.add(k));
+    this.loading.set(true);
+    this.error.set("");
+    try {
+      const res = await postJSON("/api/prs/info", { prs: todo, refresh: force });
+      const byKey = Object.fromEntries(
+        (res.prs || []).map((pr) => [`${pr.github}#${pr.number}`, pr])
+      );
+      this.prInfo.set({ ...have, ...byKey });
+      this.at.set(Date.now());
+    } catch (e) {
+      this.error.set(e.message);
+    } finally {
+      keys.forEach((k) => this._pending.delete(k));
+      this.loading.set(false);
+    }
+  }
+  // "have I reviewed this" for tracked pairs not already held.
+  async loadReviewStatus(pairs, force = false) {
+    const have = this.reviewStatus();
+    const todo = (pairs || []).filter((p) => {
+      const k = `${p.github}#${p.number}`;
+      return (force || !(k in have)) && !this._pending.has(`rs:${k}`);
+    });
+    if (!todo.length) return;
+    const keys = todo.map((p) => `${p.github}#${p.number}`);
+    keys.forEach((k) => this._pending.add(`rs:${k}`));
+    try {
+      const res = await postJSON("/api/prs/review-status", { prs: todo, refresh: force });
+      this.reviewStatus.set({ ...have, ...res.statuses || {} });
+    } catch {
+    } finally {
+      keys.forEach((k) => this._pending.delete(`rs:${k}`));
+    }
+  }
+  // full info for one {github, number} pair, fetching it if not already held
+  // (a no-op await if it's already in prInfo). Used right after tracking a new
+  // PR, to learn its branch for sibling discovery (findSiblings below).
+  async fetchOne(pair) {
+    await this.loadPrInfo([pair]);
+    return this.prInfo()[`${pair.github}#${pair.number}`] || null;
+  }
+  // the PR (if any) whose head is `branch` in each of the given repos, regardless
+  // of author — reuses the same GITHUB.prs_for_branches lookup Branches & PRs uses
+  // to resolve forward-port/colleagues' PRs. Also seeds prInfo with the full
+  // result, so a caller that tracks these doesn't re-fetch them by number right
+  // after. Returns [] on failure (never throws).
+  async findSiblings(branches) {
+    if (!branches.length) return [];
+    try {
+      const res = await postJSON("/api/prs/for-branches", { branches });
+      const prs = res.prs || [];
+      if (prs.length) {
+        const byKey = Object.fromEntries(prs.map((pr) => [`${pr.github}#${pr.number}`, pr]));
+        this.prInfo.set({ ...this.prInfo(), ...byKey });
+      }
+      return prs;
+    } catch {
+      return [];
+    }
+  }
+  // add/remove a {github, number} pair from config.reviews. `track` is a no-op
+  // (returns false) if it's already tracked. New entries go to the front, so
+  // freshly tracked PRs show up first.
+  track(config, github, number) {
+    const id = `${github}#${number}`;
+    if (config.config.reviews.some((r) => r.id === id)) return false;
+    config.updateConfig({ reviews: [{ id, github, number }, ...config.config.reviews] });
+    return true;
+  }
+  untrack(config, id) {
+    config.updateConfig({ reviews: config.config.reviews.filter((r) => r.id !== id) });
+  }
+  // untrack every id in one write (a group's "Untrack" button) rather than one
+  // updateConfig per row.
+  untrackMany(config, ids) {
+    const idSet = new Set(ids);
+    config.updateConfig({ reviews: config.config.reviews.filter((r) => !idSet.has(r.id)) });
+  }
+  // flip "important" for a whole task (every PR sharing its branch) in one write —
+  // the warning-flag toggle is a task-level concern, like untrackMany's Untrack.
+  // If any PR in the task is already flagged, this clears all of them; otherwise
+  // it flags all of them.
+  toggleImportant(config, ids) {
+    const idSet = new Set(ids);
+    const flagged = config.config.reviews.some((r) => idSet.has(r.id) && r.important);
+    config.updateConfig({
+      reviews: config.config.reviews.map(
+        (r) => idSet.has(r.id) ? { ...r, important: !flagged } : r
+      )
+    });
+  }
+};
+
+// static/src/workspaces_screen/dialogs.js
+function categoryOptions(config) {
+  const opts = (config.config.workspace_categories || []).map((c) => ({
+    value: c.id,
+    label: c.id
+  }));
+  if (!opts.some((o) => o.value === ARCHIVED_CATEGORY))
+    opts.push({ value: ARCHIVED_CATEGORY, label: ARCHIVED_CATEGORY });
+  return opts;
+}
+var configFromRepos = (repoIds, branch) => repoBranchList.format(repoIds.map((repo) => ({ repo, branch })));
+function templatePrefill(tpl) {
+  if (!tpl) return {};
+  const branch = tpl.checkouts.find((c) => c.repo === "enterprise")?.branch || tpl.checkouts.find((c) => c.repo === "community")?.branch || "";
+  return {
+    template: tpl.id,
+    name: branch,
+    config: repoBranchList.format(tpl.checkouts),
+    db: tpl.db || "",
+    args: tpl.on_create_args || "",
+    demoData: tpl.demo_data ?? true,
+    category: tpl.category || ""
+  };
+}
+var WorkspaceSourceDialog = class extends Component {
+  static template = xml`
+    <div class="dialog-backdrop" t-on-click="() => this.done(null)">
+      <div class="dialog ws-wiz" t-on-click.stop="() => {}">
+        <h2 class="dialog-title">New workspace</h2>
+        <div class="dialog-body">
+          <label class="ws-wiz-option" t-att-class="{selected: this.source() === 'template'}">
+            <input type="radio" name="ws-source" value="template" t-att-checked="this.source() === 'template'" t-on-change="() => this.source.set('template')"/>
+            <span class="ws-wiz-opt-body">
+              <span class="ws-wiz-opt-title">From a template</span>
+              <span class="ws-wiz-opt-hint dim">fork fresh branches from one of your templates — or start blank</span>
+              <select class="ws-wiz-select" t-att-disabled="this.source() !== 'template'"
+                      t-on-change="(ev) => this.template.set(ev.target.value)">
+                <option t-foreach="this.props.templates" t-as="tpl" t-key="tpl.id" t-att-value="tpl.id" t-att-selected="this.template() === tpl.id" t-out="tpl.name"/>
+                <option value="" t-att-selected="!this.template()">— start blank —</option>
+              </select>
+            </span>
+          </label>
+          <label class="ws-wiz-option" t-att-class="{selected: this.source() === 'bundle'}">
+            <input type="radio" name="ws-source" value="bundle" t-att-checked="this.source() === 'bundle'" t-on-change="() => this.source.set('bundle')"/>
+            <span class="ws-wiz-opt-body">
+              <span class="ws-wiz-opt-title">From a runbot bundle</span>
+              <span class="ws-wiz-opt-hint dim">paste a bundle URL (e.g. a colleague's work) — goo fetches its branches locally</span>
+              <input type="text" class="ws-wiz-url" placeholder="https://runbot.odoo.com/runbot/bundle/…"
+                     t-att-value="this.url()" t-att-disabled="this.source() !== 'bundle'"
+                     t-on-input="(ev) => this.url.set(ev.target.value)"
+                     t-on-keydown="(ev) => ev.key === 'Enter' &amp;&amp; this.continue_()"/>
+            </span>
+          </label>
+          <div t-if="this.error()" class="form-error" t-out="this.error()"/>
+        </div>
+        <div class="dialog-foot">
+          <button class="pbtn primary" t-att-disabled="!this.canContinue" t-on-click="() => this.continue_()">
+            <t t-if="this.busy()">Reading bundle…</t><t t-else="">Continue</t>
+          </button>
+          <button class="pbtn" t-on-click="() => this.done(null)">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  props = useProps({ done: t.function(), templates: t.any() });
+  source = signal("template");
+  template = signal("");
+  url = signal("");
+  busy = signal(false);
+  error = signal("");
+  setup() {
+    this.template.set(this.props.templates[0]?.id ?? "");
+    const onKey = (e) => {
+      if (e.key === "Escape") this.done(null);
+    };
+    onMounted(() => document.addEventListener("keydown", onKey));
+    onWillUnmount(() => document.removeEventListener("keydown", onKey));
+  }
+  done(result) {
+    this.props.done(result);
+  }
+  get canContinue() {
+    if (this.busy()) return false;
+    return this.source() === "template" || !!this.url().trim();
+  }
+  async continue_() {
+    if (!this.canContinue) return;
+    if (this.source() === "template") {
+      return this.done({ source: "template", template: this.template() });
+    }
+    this.busy.set(true);
+    this.error.set("");
+    try {
+      const info = await postJSON("/api/runbot/bundle-info", { url: this.url().trim() });
+      this.done({ source: "bundle", info });
+    } catch (e) {
+      this.error.set(e.message);
+    } finally {
+      this.busy.set(false);
+    }
+  }
+};
+async function startNewWorkspaceWizard(plugins) {
+  const { config, dialogs, code, eventLog } = plugins;
+  const res = await dialogs.openComponent(WorkspaceSourceDialog, {
+    templates: config.config.templates || []
+  });
+  if (!res) return;
+  if (res.source === "template") {
+    const tpl = (config.config.templates || []).find((x) => x.id === res.template);
+    return startCreateWorkspace(plugins, templatePrefill(tpl));
+  }
+  const info = res.info;
+  const matches = [];
+  for (const { github, branch } of info.branches || []) {
+    const repoName = github.split("/")[1];
+    const r = (config.config.repos || []).find((x) => (x.github || "").split("/")[1] === repoName);
+    if (!r || !r.path) continue;
+    const remote = github === r.github ? r.pull_remote || "origin" : r.push_remote || "dev";
+    matches.push({ repo: r, branch, remote });
+  }
+  if (!matches.length) {
+    dialogs.open({
+      title: "Workspace from bundle",
+      message: `none of the bundle's repositories (${(info.branches || []).map((b) => b.github).join(", ") || "none listed"}) match your configured repos`,
+      okLabel: "OK",
+      cancelLabel: null
+    });
+    return;
+  }
+  const results = await Promise.all(
+    matches.map(async (m2) => {
+      const eid = eventLog.begin(`fetching ${m2.branch} (${m2.repo.id}) from ${m2.remote}`);
+      try {
+        await postJSON("/api/code/remote-branch/fetch", {
+          path: m2.repo.path,
+          branch: m2.branch,
+          pull_remote: m2.remote
+        });
+        eventLog.finish(eid, "done");
+        return { ...m2, ok: true };
+      } catch (e) {
+        eventLog.finish(eid, "error");
+        return { ...m2, ok: false, error: e.message };
+      }
+    })
+  );
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length) {
+    dialogs.error(
+      "Fetching bundle branches failed",
+      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n")
+    );
+    if (failed.length === results.length) return;
+  }
+  const got = results.filter((r) => r.ok);
+  await code.refreshBranches(new Set(got.map((m2) => m2.repo.id)));
+  return startCreateWorkspace(plugins, {
+    name: info.name,
+    config: repoBranchList.format(got.map((m2) => ({ repo: m2.repo.id, branch: m2.branch }))),
+    db: info.name,
+    template: "",
+    createBranches: false
+  });
+}
+async function startCreateWorkspace(plugins, prefill = {}) {
+  const { config, dialogs, db, code, eventLog, wt } = plugins;
+  await db.load();
+  const templates = config.config.templates || [];
+  const tpl = templates.find((t2) => t2.id === prefill.template) || null;
+  const existing = config.config.workspaces || [];
+  const dbNames = new Set(db.databases().map((d) => d.name));
+  const dbOptions = db.databases().map((d) => ({ value: d.name, label: d.name }));
+  const repoOptions = (config.config.repos || []).map((r) => ({ value: r.id, label: r.id }));
+  const prefillRepoIds = prefill.config ? repoBranchList.parse(prefill.config).map((c) => c.repo) : (config.config.repos || []).filter((r) => !r.external).map((r) => r.id);
+  const res = await dialogs.open({
+    title: tpl ? `New workspace \u2014 from template "${tpl.name}"` : "New workspace",
+    okLabel: "Create",
+    validate: (v) => {
+      const name = (v.name || "").trim();
+      if (!name) return "a name is required";
+      if (existing.some((w) => w.name === name))
+        return `a workspace named "${name}" already exists`;
+      if (!repoBranchList.parse((v.config || "").trim()).length) return "a config is required";
+      if (v.location === "worktree" && !tpl)
+        return "a worktree workspace needs a template \u2014 go back and pick one as the source";
+      if ((v.cloneDb || "") && !(v.db || "").trim())
+        return "set a database name to clone the selected database into";
+      if (v.location === "worktree" && v.cloneDb && dbNames.has((v.db || "").trim()))
+        return `database "${(v.db || "").trim()}" already exists \u2014 pick a new name to clone into`;
+      return "";
+    },
+    fields: [
+      {
+        key: "location",
+        type: "select",
+        label: "Location",
+        value: "main",
+        options: [
+          { value: "main", label: "Main checkout (one loaded at a time)" },
+          { value: "worktree", label: "Own worktree + port (runs concurrently)" }
+        ]
+      },
+      {
+        key: "name",
+        type: "text",
+        label: "Name",
+        value: prefill.name ?? "",
+        placeholder: "name (e.g. master-mytask)",
+        onChange: (newName, currentValues, oldValues) => {
+          const updates = { config: configFromRepos(currentValues.repos || [], newName.trim()) };
+          if (oldValues.name)
+            updates.db = (currentValues.db || "").replaceAll(oldValues.name, newName);
+          return updates;
+        }
+      },
+      {
+        key: "repos",
+        type: "repo-checks",
+        label: "Repositories",
+        value: prefillRepoIds,
+        options: repoOptions,
+        onChange: (repoIds, currentValues) => ({
+          config: configFromRepos(repoIds, (currentValues.name || "").trim())
+        })
+      },
+      {
+        key: "config",
+        type: "text",
+        label: "Config",
+        value: prefill.config ?? (prefill.name ? configFromRepos(prefillRepoIds, prefill.name.trim()) : ""),
+        placeholder: "community:master,enterprise:master"
+      },
+      {
+        key: "db",
+        type: "text",
+        label: "Database",
+        value: prefill.db ?? "",
+        placeholder: "database name"
+      },
+      {
+        key: "args",
+        type: "text",
+        label: "Start args",
+        value: prefill.args ?? "",
+        placeholder: "-i sale_management"
+      },
+      ...config.config.workspace_categories_enabled ? [
+        {
+          key: "category",
+          type: "select",
+          label: "Category",
+          placeholder: "\u2014 none \u2014",
+          options: categoryOptions(config),
+          value: prefill.category ?? ""
+        }
+      ] : [],
+      {
+        key: "cloneDb",
+        type: "check-select",
+        label: "Clone db",
+        options: dbOptions,
+        value: "",
+        default: () => {
+          if (tpl?.db && dbNames.has(tpl.db)) return tpl.db;
+          return dbOptions[0]?.value || "";
+        }
+      },
+      {
+        key: "demoData",
+        type: "checkbox",
+        label: "Demo data",
+        value: prefill.demoData ?? true
+      },
+      {
+        key: "createBranches",
+        type: "checkbox",
+        label: "Create branches (main)",
+        value: prefill.createBranches ?? true
+      },
+      { key: "activate", type: "checkbox", label: "Activate it (main)", value: true }
+    ]
+  });
+  if (!res) return;
+  const checkouts = repoBranchList.parse(res.config.trim());
+  const startPointByRepo = Object.fromEntries(
+    (tpl?.checkouts || []).map((c) => [c.repo, c.branch])
+  );
+  for (const c of checkouts)
+    if (!startPointByRepo[c.repo]) startPointByRepo[c.repo] = baseBranchOf(c.branch);
+  if (res.location === "worktree") {
+    await wt.createWorktree({
+      name: res.name.trim(),
+      dbName: (res.db || "").trim(),
+      cloneSource: res.cloneDb || "",
+      checkouts,
+      startPointByRepo,
+      baseId: tpl?.id || "",
+      on_create_args: (res.args || "").trim(),
+      demo_data: !!res.demoData,
+      favorite: false,
+      category: res.category || "",
+      parent: prefill.parent || ""
+    });
+    return;
+  }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const ws = {
+    id: newWorkspaceId(),
+    name: res.name.trim(),
+    created_at: now,
+    last_activity: now,
+    favorite: false,
+    category: res.category || "",
+    parent: prefill.parent || "",
+    db: (res.db || "").trim(),
+    on_create_args: (res.args || "").trim(),
+    demo_data: !!res.demoData,
+    location: "main",
+    worktree: null,
+    port: null,
+    checkouts
+  };
+  eventLog.add(`creating workspace ${ws.name}`);
+  config.updateConfig({ workspaces: [...config.config.workspaces, ws] });
+  if (res.createBranches) {
+    const pathByRepo = Object.fromEntries(config.config.repos.map((r) => [r.id, r.path]));
+    await code.createBranches(
+      checkouts.map((c) => ({
+        path: pathByRepo[c.repo],
+        name: c.branch,
+        startPoint: startPointByRepo[c.repo],
+        freshStart: true
+      }))
+    );
+  }
+  if (res.activate) await config.workspace(ws.id)?.activate();
+  if (res.cloneDb && ws.db && res.cloneDb !== ws.db) {
+    await db.cloneStoppingServer(res.cloneDb, ws.db);
+  }
+  wt.select(ws.id);
+}
+function findSubWorkspace(config, parentWs, row) {
+  const isFwOnto = (branch) => typeof branch === "string" && branch.startsWith(`${row.branch}-`) && branch.endsWith("-fw");
+  return (config.config.workspaces || []).find(
+    (w) => w.parent === parentWs.id && (w.checkouts || []).some((c) => isFwOnto(c.branch))
+  ) || null;
+}
+async function resolvePrBranches(plugins, targets) {
+  const { code, dialogs, eventLog } = plugins;
+  const results = await Promise.all(
+    targets.map(async ({ repo, pull }) => {
+      const eid = eventLog.begin(`fetching PR #${pull.number} (${repo.id})`);
+      try {
+        const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
+        const branch = head.branch;
+        if (!branch) throw new Error("could not resolve the PR's head branch");
+        await postJSON("/api/code/remote-branch/fetch", {
+          path: repo.path,
+          branch,
+          pull_remote: repo.push_remote || "dev"
+        });
+        eventLog.finish(eid, "done");
+        return { repo, branch, ok: true };
+      } catch (e) {
+        eventLog.finish(eid, "error");
+        return { repo, ok: false, error: e.message };
+      }
+    })
+  );
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length) {
+    dialogs.error(
+      "Fetching PR branch failed",
+      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n")
+    );
+  }
+  const got = results.filter((r) => r.ok);
+  if (!got.length) return null;
+  await code.refreshBranches(new Set(got.map((g) => g.repo.id)));
+  return got;
+}
+async function createSubWorkspaceFromForwardPort(plugins, parentWs, row) {
+  const { config, dialogs, wt } = plugins;
+  const existing = findSubWorkspace(config, parentWs, row);
+  if (existing) {
+    wt.select(existing.id);
+    return;
+  }
+  const repoFor = (slug) => {
+    const exact = (config.config.repos || []).find((r) => r.github === slug);
+    if (exact) return exact;
+    const name2 = slug.split("/")[1];
+    return (config.config.repos || []).find((r) => (r.github || "").split("/")[1] === name2) || null;
+  };
+  const targets = [];
+  for (const cell of row.cells || []) {
+    const repo = repoFor(cell.repository);
+    const pull = (cell.pulls || [])[0];
+    if (repo && repo.path && pull) targets.push({ repo, pull });
+  }
+  if (!targets.length) {
+    return dialogs.open({
+      title: "Create sub workspace",
+      message: `no forward-port PR here maps to a configured repo (${(row.cells || []).map((c) => c.repository).join(", ") || "none"})`,
+      okLabel: "OK",
+      cancelLabel: null
+    });
+  }
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
+  const name = got[0].branch;
+  return startCreateWorkspace(plugins, {
+    name,
+    config: repoBranchList.format(got.map((g) => ({ repo: g.repo.id, branch: g.branch }))),
+    db: name,
+    template: "",
+    createBranches: false,
+    parent: parentWs.id,
+    category: parentWs.category || ""
+  });
+}
+async function createWorkspaceFromPRs(plugins, targets) {
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
+  const name = got[0].branch;
+  return startCreateWorkspace(plugins, {
+    name,
+    config: repoBranchList.format(got.map((g) => ({ repo: g.repo.id, branch: g.branch }))),
+    db: name,
+    template: "",
+    createBranches: false
+  });
+}
+async function adoptCurrentCheckout(plugins) {
+  const { config, dialogs, code, eventLog, wt, server } = plugins;
+  const fail = (message) => dialogs.open({ title: "Adopt current checkout", message, okLabel: "OK", cancelLabel: null });
+  await code.loadBranches(/* @__PURE__ */ new Set(["community", "enterprise"]));
+  const byId = Object.fromEntries(code.branchRepos().map((r) => [r.id, r]));
+  const checkouts = [];
+  for (const id of ["community", "enterprise"]) {
+    const cur = byId[id]?.current;
+    if (cur && cur !== "(detached)") checkouts.push({ repo: id, branch: cur });
+  }
+  if (!checkouts.some((c) => c.repo === "community")) {
+    const why = code.error() ? ` (${code.error()})` : " (detached HEAD?)";
+    return fail(`couldn't read the community checkout${why} \u2014 check out a branch there first`);
+  }
+  const makeLoaded = async (ws2) => {
+    const s = server.status();
+    const busy = s.state === "running" || s.state === "starting";
+    const activeId = server.loadedWorkspaceId();
+    if (ws2.id === activeId) return;
+    if (busy) {
+      const running = (config.config.workspaces || []).find((w) => w.id === activeId);
+      const ok = await dialogs.open({
+        title: "Adopt current checkout",
+        message: `The main server is running${running ? ` workspace "${running.name}"` : ""} \u2014 stop it and make "${ws2.name}" the loaded workspace?`,
+        okLabel: "Stop & adopt"
+      });
+      if (!ok) return;
+      await server.stop();
+    }
+    server.setLastWorkspace(ws2.id);
+    config.workspace(ws2.id)?.touchActivity();
+  };
+  const existing = config.config.workspaces || [];
+  const match = existing.find(
+    (w) => w.location !== "worktree" && (w.checkouts || []).length > 0 && (w.checkouts || []).every(({ repo, branch }) => byId[repo]?.current === branch)
+  );
+  if (match) {
+    eventLog.add(`adopting current checkout \u2192 existing workspace ${match.name}`);
+    await makeLoaded(match);
+    wt.select(match.id);
+    return;
+  }
+  const feature = checkouts.map((c) => c.branch).find((b) => !BASE_BRANCH_RE.test(b)) || checkouts[0].branch;
+  let name = feature;
+  const names = new Set(existing.map((w) => w.name));
+  for (let i = 2; names.has(name); i++) name = `${feature}-${i}`;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const ws = {
+    id: newWorkspaceId(),
+    name,
+    created_at: now,
+    last_activity: now,
+    favorite: false,
+    db: name,
+    on_create_args: "",
+    demo_data: true,
+    location: "main",
+    worktree: null,
+    port: null,
+    checkouts
+  };
+  eventLog.add(`creating workspace ${ws.name} from the current checkout`);
+  config.updateConfig({ workspaces: [...existing, ws] });
+  await makeLoaded(ws);
+  wt.select(ws.id);
+}
+async function deleteWorkspaceDialog(ws, { config, code, db, eventLog, repoMap, isActive, dialogs, wt, server }) {
+  if (isActive) return;
+  const descendants = descendantWorkspaces(config.config.workspaces || [], ws.id);
+  const groups = code.groups();
+  const branches = (ws.checkouts || []).map(({ repo, branch }) => ({ repo, branch, b: repoMap[repo]?.branches.get(branch) })).filter((x) => x.b && !BASE_BRANCH_RE.test(x.branch)).map((x) => ({
+    repo: x.repo,
+    branch: x.branch,
+    path: groups.pathByRepo[x.repo],
+    remote: !!x.b.remote
+  }));
+  const prs = (ws.checkouts || []).map(({ repo, branch }) => ({
+    pr: groups.prIndex[`${repo}:${branch}`],
+    github: groups.githubByRepo[repo]
+  })).filter((x) => x.pr && x.pr.state === "open" && x.github).map((x) => ({ github: x.github, number: x.pr.number }));
+  const fields2 = [];
+  if (branches.length)
+    fields2.push({
+      key: "delBranches",
+      type: "checkbox",
+      label: `Also delete ${branches.length === 1 ? "its branch" : `its ${branches.length} branches`}`,
+      value: true
+    });
+  if (branches.some((b) => b.remote))
+    fields2.push({
+      key: "delRemote",
+      type: "checkbox",
+      label: "\u2026also on the push remote",
+      value: true
+    });
+  if (prs.length)
+    fields2.push({
+      key: "closePrs",
+      type: "checkbox",
+      label: `Close ${prs.length === 1 ? "its open pull request" : `its ${prs.length} open pull requests`}`,
+      value: true
+    });
+  const dbExists = ws.db && db.databases().some((d) => d.name === ws.db);
+  if (dbExists)
+    fields2.push({
+      key: "dropDb",
+      type: "checkbox",
+      label: `Drop database "${ws.db}"`,
+      value: true
+    });
+  const res = await dialogs.open({
+    title: `Delete "${ws.name}"?`,
+    message: "The workspace will be removed from your list. This cannot be undone." + (descendants.length ? ` This also removes ${descendants.length} sub-workspace${descendants.length === 1 ? "" : "s"} spawned from it.` : ""),
+    okLabel: "Delete",
+    fields: fields2
+  });
+  if (!res) return;
+  eventLog.add(`deleting workspace ${ws.name}`);
+  const ops = [];
+  if (res.closePrs) for (const p of prs) ops.push(code.closePrNoConfirm(p.github, p.number));
+  if (res.delBranches)
+    for (const b of branches)
+      ops.push(code.deleteBranchNoConfirm(b.branch, b.repo, b.path, !!res.delRemote && b.remote));
+  if (res.dropDb && ws.db) ops.push(db.drop(ws.db));
+  await Promise.all(ops);
+  config.updateConfig({
+    workspaces: config.config.workspaces.filter((w) => w.id !== ws.id)
+  });
+  const { skipped } = await cascadeRemoveDescendants({ config, wt, eventLog, server }, ws);
+  if (skipped.length) {
+    await dialogs.open({
+      title: "Some sub-workspaces were kept",
+      message: skipped.map(
+        (w) => `"${w.name}" is still busy (its server is running, or it's the loaded workspace) \u2014 kept, no longer linked to the deleted parent.`
+      ).join("\n"),
+      okLabel: "OK",
+      cancelLabel: null
+    });
+  }
+}
+
+// static/src/reviews_screen/cells.js
+function isMerged(row, mbState) {
+  return row.state === "merged" || mbState === "merged";
+}
+var PrCell2 = class extends Component {
+  props = useProps({ row: t.any(), screen: t.any() });
+  code = usePlugin(CodePlugin);
+  static template = xml`
+    <span class="rev-pr">
+      <t t-if="this.row.loaded">
+        <a class="pr-link" target="_blank" t-att-href="this.row.url" t-out="'#' + this.row.number"/>
+        <span class="rev-pr-title" t-out="this.row.title"/>
+        <span class="pr-state" t-att-class="this.state" t-out="this.state"/>
+      </t>
+      <span t-else="" class="dim" t-out="'#' + this.row.number + '…'"/>
+    </span>`;
+  get row() {
+    return this.props.row;
+  }
+  get state() {
+    if (isMerged(this.row, this.code.mergebot()[`${this.row.github}#${this.row.number}`] || ""))
+      return "merged";
+    return this.row.draft && this.row.state === "open" ? "draft" : this.row.state;
+  }
+};
+var STATUS_META = {
+  merged: { label: "Merged", cls: "merged" },
+  rplus: { label: "R+'d", cls: "ready" },
+  reviewed: { label: "Reviewed", cls: "progress" },
+  to_review: { label: "To review", cls: "blocked" }
+};
+function statusKey(row, mbState, mbDetail) {
+  if (isMerged(row, mbState)) return "merged";
+  if (mbIsRPlus(mbState, mbDetail)) return "rplus";
+  if (row.reviewStatus === "reviewed") return "reviewed";
+  return "to_review";
+}
+var PRECEDENCE = ["to_review", "reviewed", "rplus", "merged"];
+function worstStatusKey(keys) {
+  let worst = "merged";
+  for (const k of keys) {
+    if (PRECEDENCE.indexOf(k) < PRECEDENCE.indexOf(worst)) worst = k;
+  }
+  return worst;
+}
+function taskFullyMerged(rows, code) {
+  return rows.every((row) => {
+    const key = `${row.github}#${row.number}`;
+    const mbState = code.mergebot()[key] || "";
+    if (!isMerged(row, mbState)) return false;
+    return (code.mbForwardPorts()[key] || []).every((fp) => {
+      const pulls = (fp.cells || []).flatMap((c) => c.pulls || []);
+      if (!pulls.length) return false;
+      return pulls.every((p) => code.mergebot()[`${p.github}#${p.number}`] === "merged");
+    });
+  });
+}
+var StatusCell = class extends Component {
+  props = useProps({ row: t.any(), screen: t.any() });
+  code = usePlugin(CodePlugin);
+  static template = xml`
+    <span t-if="this.row.loaded" class="dash-pr-state" t-att-class="this.meta.cls" t-out="this.meta.label"/>
+    <span t-else="" class="brg-dash">—</span>`;
+  get row() {
+    return this.props.row;
+  }
+  get _key() {
+    return `${this.row.github}#${this.row.number}`;
+  }
+  get mbState() {
+    return this.code.mergebot()[this._key] || "";
+  }
+  get mbDetail() {
+    return this.code.mbDetails()[this._key] || "";
+  }
+  get meta() {
+    return STATUS_META[statusKey(this.row, this.mbState, this.mbDetail)];
+  }
+};
+var ForwardPortsCell = class extends Component {
+  props = useProps({ row: t.any(), screen: t.any() });
+  code = usePlugin(CodePlugin);
+  reviews = usePlugin(ReviewsPlugin);
+  static template = xml`
+    <span class="rev-fwports">
+      <t t-foreach="this.rows" t-as="fp" t-key="fp.branch">
+        <button t-if="this.hasPull(fp)" type="button" class="dash-pr-state" t-att-class="this.cls(fp)"
+                t-att-title="this.title(fp)"
+                t-on-click.stop="(ev) => this.props.screen.openForwardPortMenu(ev, this.props.row, fp)"
+                t-out="fp.branch"/>
+        <span t-else="" class="dash-pr-state other" t-att-title="fp.branch + ': not opened yet'" t-out="fp.branch"/>
+      </t>
+      <span t-if="!this.rows.length" class="brg-dash">—</span>
+    </span>`;
+  get rows() {
+    const row = this.props.row;
+    const key = `${row.github}#${row.number}`;
+    if (!isMerged(row, this.code.mergebot()[key] || "")) return [];
+    return this.code.mbForwardPorts()[key] || [];
+  }
+  _pulls(fp) {
+    return (fp.cells || []).flatMap((c) => c.pulls || []);
+  }
+  hasPull(fp) {
+    return this._pulls(fp).length > 0;
+  }
+  _pullStatusKey(pull) {
+    const key = `${pull.github}#${pull.number}`;
+    const mbState = this.code.mergebot()[key] || "";
+    const mbDetail = this.code.mbDetails()[key] || "";
+    const reviewStatus = this.reviews.reviewStatus()[key];
+    return statusKey({ reviewStatus }, mbState, mbDetail);
+  }
+  cls(fp) {
+    return STATUS_META[worstStatusKey(this._pulls(fp).map((p) => this._pullStatusKey(p)))].cls;
+  }
+  title(fp) {
+    return this._pulls(fp).map((p) => `${p.github}#${p.number}: ${STATUS_META[this._pullStatusKey(p)].label}`).join("\n");
+  }
+};
+
+// static/src/reviews_screen/reviews.js
+function parsePrRef(text) {
+  const url = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(text);
+  if (url) return { github: url[1], number: Number(url[2]) };
+  const short = /^([\w.-]+\/[\w.-]+)#(\d+)$/.exec(text.trim());
+  if (short) return { github: short[1], number: Number(short[2]) };
+  return null;
+}
+var ReviewsScreen = class extends Component {
+  static components = { Panel, RecordList };
+  static template = xml`
+    <section>
+      <Panel title="'Reviews'">
+        <t t-set-slot="title-extra">
+          <div class="panel-inline-actions">
+            <span class="sub" t-out="this.count"/>
+          </div>
+        </t>
+        <t t-set-slot="top-middle">
+          <form class="rev-add" t-on-submit.prevent="() => this.addPr()">
+            <input type="text" t-att-value="this.addPrText()" autocomplete="off"
+                   placeholder="PR URL or owner/repo#123"
+                   t-on-input="ev => this.addPrText.set(ev.target.value)"/>
+            <button type="submit" class="pbtn">Add PR</button>
+          </form>
+          <span t-if="this.addPrNote()" class="dim rev-add-note" t-out="this.addPrNote()"/>
+          <select t-att-value="this.statusFilter()" t-on-change="ev => this.statusFilter.set(ev.target.value)" title="filter by status">
+            <option value="">All</option>
+            <option value="to_review">To review</option>
+            <option value="reviewed">Reviewed</option>
+            <option value="rplus">R+'d</option>
+            <option value="merged">Merged</option>
+          </select>
+        </t>
+        <t t-set-slot="top-right">
+          <span class="meta" t-out="this.stamp"/>
+          <button class="pbtn danger" t-att-disabled="!this.mergedTaskCount" t-on-click="() => this.untrackAllMerged()">Untrack all merged (<t t-out="this.mergedTaskCount"/>)</button>
+          <button class="pbtn" t-on-click="() => this.refresh()"><t t-out="this.refreshIcon"/>Refresh</button>
+        </t>
+      </Panel>
+      <div class="content br-fill">
+        <div t-if="this.reviews.error()" class="dim br-empty" t-out="'Failed to load: ' + this.reviews.error()"/>
+        <div t-elif="!this.groupsView().length" class="dim br-empty">No PRs tracked yet — paste one above.</div>
+        <div t-else="" class="br-card">
+          <div class="brg-table">
+            <RecordList recordset="this.rs" groupBy="this.groupByBranch"
+                        collapsible="true" stateKey="'goo-review-queue-collapsed'">
+              <t t-set-slot="group-header" t-slot-scope="scope">
+                <span class="rl-group-label" t-out="scope.g.key"/>
+                <span t-if="scope.g.rows.length > 1" class="dash-pr-state" t-att-class="this.rollup(scope.g.rows).cls" t-out="this.rollup(scope.g.rows).label"/>
+                <span class="rl-group-count" t-out="'(' + scope.g.rows.length + ')'"/>
+                <button class="rev-important" t-att-class="{on: this.isImportant(scope.g.rows)}"
+                        t-att-title="this.isImportant(scope.g.rows) ? 'unflag as important' : 'flag as important'"
+                        t-on-click.stop="(ev) => this.toggleImportant(scope.g.rows)"><t t-out="this.warningIcon"/></button>
+                <button class="dash-kebab" title="task actions" t-on-click.stop="(ev) => this.openGroupMenu(ev, scope.g.rows)"><t t-out="this.kebabIcon"/></button>
+              </t>
+            </RecordList>
+          </div>
+        </div>
+      </div>
+    </section>`;
+  code = usePlugin(CodePlugin);
+  config = usePlugin(ConfigPlugin);
+  db = usePlugin(DatabasePlugin);
+  dialogs = usePlugin(DialogPlugin);
+  eventLog = usePlugin(EventLogPlugin);
+  wt = usePlugin(WorkspacePlugin);
+  reviews = usePlugin(ReviewsPlugin);
+  refreshIcon = m(ICONS.refresh);
+  kebabIcon = m(ICONS.kebab);
+  warningIcon = m(ICONS.warning);
+  addPrText = signal("");
+  addPrNote = signal("");
+  statusFilter = signal("");
+  // "" = all
+  // one row per tracked {id, github, number}, enriched with fetched PR info +
+  // review status once they've loaded (loaded=false until then).
+  allRows = computed(() => {
+    const tracked = this.config.config.reviews || [];
+    const prInfo = this.reviews.prInfo();
+    const reviewStatus = this.reviews.reviewStatus();
+    return tracked.map((t2) => {
+      const info = prInfo[t2.id];
+      return {
+        id: t2.id,
+        github: t2.github,
+        number: t2.number,
+        // groups alone (by its own id) until its branch is known, so loading
+        // rows never transiently pile into one shared group
+        branch: info?.branch || t2.id,
+        title: info?.title || "",
+        url: info?.url || `https://github.com/${t2.github}/pull/${t2.number}`,
+        state: info?.state || "",
+        draft: info?.draft || false,
+        loaded: !!info,
+        reviewStatus: reviewStatus[t2.id],
+        important: !!t2.important
+      };
+    });
+  });
+  // grouped by branch, filtered group-wise (a task stays visible if ANY of its
+  // PRs matches the selected status) — same pattern as Branches & PRs.
+  groupsView = computed(() => {
+    const byBranch = /* @__PURE__ */ new Map();
+    for (const row of this.allRows()) {
+      if (!byBranch.has(row.branch)) byBranch.set(row.branch, []);
+      byBranch.get(row.branch).push(row);
+    }
+    const status = this.statusFilter();
+    return [...byBranch.entries()].map(([key, rows]) => ({ key, rows })).filter((g) => !status || g.rows.some((r) => this._statusKey(r) === status));
+  });
+  rows = () => this.groupsView().flatMap((g) => g.rows);
+  groupByBranch = (row) => row.branch;
+  // every forward-port pull across every merged tracked row — their own
+  // mergebot/review status needs its own fetch, since the tracked row's own
+  // fetch only covers the row's own PR, not what its forward-port matrix names.
+  forwardPortPairs = computed(() => {
+    const seen = /* @__PURE__ */ new Set();
+    const pairs = [];
+    for (const row of this.allRows()) {
+      const key = `${row.github}#${row.number}`;
+      if (!isMerged(row, this.code.mergebot()[key] || "")) continue;
+      for (const fp of this.code.mbForwardPorts()[key] || []) {
+        for (const pull of (fp.cells || []).flatMap((c) => c.pulls || [])) {
+          const k = `${pull.github}#${pull.number}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          pairs.push({ github: pull.github, number: pull.number });
+        }
+      }
+    }
+    return pairs;
+  });
+  _cell = (row) => ({ row, screen: this });
+  rs = recordset(this.rows, [
+    { name: "repo", label: "Repo", get: (r) => this._repoLabel(r.github) },
+    { name: "pr", label: "PR", component: PrCell2, cellProps: this._cell },
+    { name: "status", label: "Status", component: StatusCell, cellProps: this._cell },
+    { name: "fwports", label: "Forward ports", component: ForwardPortsCell, cellProps: this._cell },
+    { name: "act", label: "", component: ActionsCell, cellProps: this._cell }
+  ]);
+  setup() {
+    useEffect(() => {
+      const tracked = this.config.config.reviews || [];
+      if (!tracked.length) return;
+      this.reviews.loadPrInfo(tracked);
+      this.reviews.loadReviewStatus(tracked);
+      this.code.loadMergebot(tracked);
+    });
+    useEffect(() => {
+      const pairs = this.forwardPortPairs();
+      if (!pairs.length) return;
+      this.code.loadMergebot(pairs);
+      this.reviews.loadReviewStatus(pairs);
+    });
+  }
+  _statusKey(row) {
+    const key = `${row.github}#${row.number}`;
+    return statusKey(row, this.code.mergebot()[key] || "", this.code.mbDetails()[key] || "");
+  }
+  _repoLabel(github) {
+    const repo = (this.config.config.repos || []).find((r) => r.github === github);
+    return repo ? repo.id : github;
+  }
+  // worst-of across a group's rows, in STATUS_META's precedence order
+  rollup(rows) {
+    return STATUS_META[worstStatusKey(rows.map((r) => this._statusKey(r)))];
+  }
+  // a task (group of rows) is "important" if any of its PRs is flagged
+  isImportant(rows) {
+    return rows.some((r) => r.important);
+  }
+  toggleImportant(rows) {
+    this.reviews.toggleImportant(
+      this.config,
+      rows.map((r) => r.id)
+    );
+  }
+  get count() {
+    const n = (this.config.config.reviews || []).length;
+    return `${n} PR${n === 1 ? "" : "s"}`;
+  }
+  get stamp() {
+    if (this.reviews.loading()) return "refreshing\u2026";
+    return this.reviews.at() ? `updated ${timeAgo(new Date(this.reviews.at()).toISOString())}` : "";
+  }
+  async addPr() {
+    const text = this.addPrText().trim();
+    if (!text) return;
+    const ref = parsePrRef(text);
+    if (!ref) {
+      this.addPrNote.set("paste a GitHub PR URL or owner/repo#123");
+      return;
+    }
+    const added = this.reviews.track(this.config, ref.github, ref.number);
+    this.addPrText.set("");
+    if (!added) {
+      this.addPrNote.set("already tracked");
+      return;
+    }
+    this.addPrNote.set("");
+    await this.discoverSiblings(ref);
+  }
+  // once a PR is tracked, look for a sibling PR on the same branch in every
+  // OTHER configured repo (the cross-repo task convention) and track those too
+  // — so adding one PR of a multi-repo task picks up the rest automatically.
+  async discoverSiblings(ref) {
+    const info = await this.reviews.fetchOne(ref);
+    if (!info?.branch) return;
+    const otherRepos = (this.config.config.repos || []).filter(
+      (r) => r.github && r.github !== ref.github
+    );
+    if (!otherRepos.length) return;
+    const siblings = await this.reviews.findSiblings(
+      otherRepos.map((r) => ({ github: r.github, branch: info.branch }))
+    );
+    const added = siblings.filter((s) => this.reviews.track(this.config, s.github, s.number));
+    if (added.length)
+      this.addPrNote.set(
+        `+${added.length} related PR${added.length === 1 ? "" : "s"} found on "${info.branch}"`
+      );
+  }
+  async refresh() {
+    const tracked = this.config.config.reviews || [];
+    const fpPairs = this.forwardPortPairs();
+    await Promise.all([
+      this.reviews.loadPrInfo(tracked, true),
+      this.reviews.loadReviewStatus(tracked, true),
+      this.reviews.loadReviewStatus(fpPairs, true),
+      this.code.refreshStatuses([], [...tracked, ...fpPairs])
+    ]);
+  }
+  _dialogPlugins() {
+    return {
+      config: this.config,
+      dialogs: this.dialogs,
+      db: this.db,
+      code: this.code,
+      eventLog: this.eventLog,
+      wt: this.wt
+    };
+  }
+  // a row's repo — resolved from its github slug against configured repos (a
+  // tracked PR whose repo isn't configured locally has no checkout to branch)
+  _repoFor(github) {
+    return (this.config.config.repos || []).find((r) => r.github === github) || null;
+  }
+  async createRowWorkspace(row) {
+    const repo = this._repoFor(row.github);
+    if (!repo || !repo.path) {
+      await this.dialogs.open({
+        title: "Create workspace",
+        message: `${row.github} isn't a configured repo with a local checkout.`,
+        okLabel: "OK",
+        cancelLabel: null
+      });
+      return;
+    }
+    return createWorkspaceFromPRs(this._dialogPlugins(), [
+      { repo, pull: { github: row.github, number: row.number } }
+    ]);
+  }
+  async createTaskWorkspace(rows) {
+    const targets = rows.map((row) => ({ repo: this._repoFor(row.github), pull: { github: row.github, number: row.number } })).filter((t2) => t2.repo && t2.repo.path);
+    if (!targets.length) return;
+    return createWorkspaceFromPRs(this._dialogPlugins(), targets);
+  }
+  // how many tasks are fully merged (base PR(s) + every forward port) — drives
+  // the top bar's "Untrack all merged" button, both its visibility and count.
+  get mergedTaskCount() {
+    return this.groupsView().filter((g) => taskFullyMerged(g.rows, this.code)).length;
+  }
+  // untracking a task that isn't fully merged yet means goo stops following
+  // it through review/merge — worth a pause. A fully-merged task has nothing
+  // left to lose, so it skips the prompt.
+  async _confirmUntrack(rows) {
+    if (taskFullyMerged(rows, this.code)) return true;
+    const n = rows.length;
+    const res = await this.dialogs.open({
+      title: `Untrack unmerged PR${n === 1 ? "" : "s"}?`,
+      message: "The base PR or one of its forward ports hasn't been merged yet. Untracking it now means goo stops following it through review and merge.",
+      okLabel: "Untrack anyway"
+    });
+    return !!res;
+  }
+  async untrackGroup(rows) {
+    if (!await this._confirmUntrack(rows)) return;
+    this.reviews.untrackMany(
+      this.config,
+      rows.map((r) => r.id)
+    );
+  }
+  // bulk-drop every task that's fully merged (base PR(s) + every forward port)
+  // — the top bar's "Untrack all merged" button.
+  async untrackAllMerged() {
+    const groups = this.groupsView().filter((g) => taskFullyMerged(g.rows, this.code));
+    if (!groups.length) return;
+    const n = groups.length;
+    const res = await this.dialogs.open({
+      title: `Untrack ${n} fully-merged task${n === 1 ? "" : "s"}?`,
+      message: "Every base PR and forward port in these tasks has been merged.",
+      okLabel: "Untrack"
+    });
+    if (!res) return;
+    this.reviews.untrackMany(
+      this.config,
+      groups.flatMap((g) => g.rows.map((r) => r.id))
+    );
+  }
+  // a task's (group header's) menu: Create workspace always; Open on GitHub /
+  // Open on mergebot only for a single-PR task (ambiguous which PR otherwise —
+  // the row's own kebab covers that case); Untrack drops every PR in the task.
+  openGroupMenu(ev, rows) {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const actions = [{ label: "Create workspace", onClick: () => this.createTaskWorkspace(rows) }];
+    if (rows.length === 1) {
+      const row = rows[0];
+      actions.push({ label: "Open on GitHub", onClick: () => window.open(row.url, "_blank") });
+      actions.push({
+        label: "Open on mergebot",
+        onClick: () => window.open(this.code.mergebotUrl(row.github, row.number), "_blank")
+      });
+    }
+    actions.push({
+      label: "Untrack",
+      danger: true,
+      onClick: () => this.untrackGroup(rows)
+    });
+    appBus.dispatchEvent(new CustomEvent("action-menu", { detail: { rect, actions } }));
+  }
+  hasRowMenu() {
+    return true;
+  }
+  // a forward-port branch's menu: one Create workspace spanning every repo the
+  // branch's PRs are in, plus per-PR Open on GitHub / Open on mergebot / Send
+  // r+ (repo-suffixed only when the branch spans more than one repo).
+  openForwardPortMenu(ev, row, fp) {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const pulls = (fp.cells || []).flatMap((c) => c.pulls || []);
+    const targets = pulls.map((p) => ({ repo: this._repoFor(p.github), pull: { github: p.github, number: p.number } })).filter((t2) => t2.repo && t2.repo.path);
+    const actions = [];
+    if (targets.length)
+      actions.push({
+        label: "Create workspace",
+        onClick: () => createWorkspaceFromPRs(this._dialogPlugins(), targets)
+      });
+    for (const p of pulls) {
+      const suffix = pulls.length > 1 ? ` (${this._repoLabel(p.github)})` : "";
+      actions.push({
+        label: `Open on GitHub${suffix}`,
+        onClick: () => window.open(this.code.pullRequestUrl(p.github, p.number), "_blank")
+      });
+      actions.push({
+        label: `Open on mergebot${suffix}`,
+        onClick: () => window.open(this.code.mergebotUrl(p.github, p.number), "_blank")
+      });
+      actions.push({
+        label: `Send r+${suffix}`,
+        onClick: () => this.code.postRPlus(p.github, p.number)
+      });
+    }
+    appBus.dispatchEvent(new CustomEvent("action-menu", { detail: { rect, actions } }));
+  }
+  openRowMenu(ev, row) {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const actions = [
+      { label: "Create workspace", onClick: () => this.createRowWorkspace(row) },
+      { label: "Open on GitHub", onClick: () => window.open(row.url, "_blank") }
+    ];
+    if (row.loaded)
+      actions.push({
+        label: "Open on mergebot",
+        onClick: () => window.open(this.code.mergebotUrl(row.github, row.number), "_blank")
+      });
+    actions.push({
+      label: "Untrack",
+      danger: true,
+      onClick: () => this.untrackRow(row)
+    });
+    appBus.dispatchEvent(new CustomEvent("action-menu", { detail: { rect, actions } }));
+  }
+  async untrackRow(row) {
+    if (!await this._confirmUntrack([row])) return;
+    this.reviews.untrack(this.config, row.id);
+  }
+};
+
 // static/src/core/terminal_plugin.js
 var TerminalPlugin = class extends Plugin {
   open = signal(false);
@@ -9412,562 +10640,6 @@ var TodoScreen = class extends Component {
     );
   }
 };
-
-// static/src/workspaces_screen/dialogs.js
-function categoryOptions(config) {
-  const opts = (config.config.workspace_categories || []).map((c) => ({
-    value: c.id,
-    label: c.id
-  }));
-  if (!opts.some((o) => o.value === ARCHIVED_CATEGORY))
-    opts.push({ value: ARCHIVED_CATEGORY, label: ARCHIVED_CATEGORY });
-  return opts;
-}
-var configFromRepos = (repoIds, branch) => repoBranchList.format(repoIds.map((repo) => ({ repo, branch })));
-function templatePrefill(tpl) {
-  if (!tpl) return {};
-  const branch = tpl.checkouts.find((c) => c.repo === "enterprise")?.branch || tpl.checkouts.find((c) => c.repo === "community")?.branch || "";
-  return {
-    template: tpl.id,
-    name: branch,
-    config: repoBranchList.format(tpl.checkouts),
-    db: tpl.db || "",
-    args: tpl.on_create_args || "",
-    demoData: tpl.demo_data ?? true,
-    category: tpl.category || ""
-  };
-}
-var WorkspaceSourceDialog = class extends Component {
-  static template = xml`
-    <div class="dialog-backdrop" t-on-click="() => this.done(null)">
-      <div class="dialog ws-wiz" t-on-click.stop="() => {}">
-        <h2 class="dialog-title">New workspace</h2>
-        <div class="dialog-body">
-          <label class="ws-wiz-option" t-att-class="{selected: this.source() === 'template'}">
-            <input type="radio" name="ws-source" value="template" t-att-checked="this.source() === 'template'" t-on-change="() => this.source.set('template')"/>
-            <span class="ws-wiz-opt-body">
-              <span class="ws-wiz-opt-title">From a template</span>
-              <span class="ws-wiz-opt-hint dim">fork fresh branches from one of your templates — or start blank</span>
-              <select class="ws-wiz-select" t-att-disabled="this.source() !== 'template'"
-                      t-on-change="(ev) => this.template.set(ev.target.value)">
-                <option t-foreach="this.props.templates" t-as="tpl" t-key="tpl.id" t-att-value="tpl.id" t-att-selected="this.template() === tpl.id" t-out="tpl.name"/>
-                <option value="" t-att-selected="!this.template()">— start blank —</option>
-              </select>
-            </span>
-          </label>
-          <label class="ws-wiz-option" t-att-class="{selected: this.source() === 'bundle'}">
-            <input type="radio" name="ws-source" value="bundle" t-att-checked="this.source() === 'bundle'" t-on-change="() => this.source.set('bundle')"/>
-            <span class="ws-wiz-opt-body">
-              <span class="ws-wiz-opt-title">From a runbot bundle</span>
-              <span class="ws-wiz-opt-hint dim">paste a bundle URL (e.g. a colleague's work) — goo fetches its branches locally</span>
-              <input type="text" class="ws-wiz-url" placeholder="https://runbot.odoo.com/runbot/bundle/…"
-                     t-att-value="this.url()" t-att-disabled="this.source() !== 'bundle'"
-                     t-on-input="(ev) => this.url.set(ev.target.value)"
-                     t-on-keydown="(ev) => ev.key === 'Enter' &amp;&amp; this.continue_()"/>
-            </span>
-          </label>
-          <div t-if="this.error()" class="form-error" t-out="this.error()"/>
-        </div>
-        <div class="dialog-foot">
-          <button class="pbtn primary" t-att-disabled="!this.canContinue" t-on-click="() => this.continue_()">
-            <t t-if="this.busy()">Reading bundle…</t><t t-else="">Continue</t>
-          </button>
-          <button class="pbtn" t-on-click="() => this.done(null)">Cancel</button>
-        </div>
-      </div>
-    </div>`;
-  props = useProps({ done: t.function(), templates: t.any() });
-  source = signal("template");
-  template = signal("");
-  url = signal("");
-  busy = signal(false);
-  error = signal("");
-  setup() {
-    this.template.set(this.props.templates[0]?.id ?? "");
-    const onKey = (e) => {
-      if (e.key === "Escape") this.done(null);
-    };
-    onMounted(() => document.addEventListener("keydown", onKey));
-    onWillUnmount(() => document.removeEventListener("keydown", onKey));
-  }
-  done(result) {
-    this.props.done(result);
-  }
-  get canContinue() {
-    if (this.busy()) return false;
-    return this.source() === "template" || !!this.url().trim();
-  }
-  async continue_() {
-    if (!this.canContinue) return;
-    if (this.source() === "template") {
-      return this.done({ source: "template", template: this.template() });
-    }
-    this.busy.set(true);
-    this.error.set("");
-    try {
-      const info = await postJSON("/api/runbot/bundle-info", { url: this.url().trim() });
-      this.done({ source: "bundle", info });
-    } catch (e) {
-      this.error.set(e.message);
-    } finally {
-      this.busy.set(false);
-    }
-  }
-};
-async function startNewWorkspaceWizard(plugins) {
-  const { config, dialogs, code, eventLog } = plugins;
-  const res = await dialogs.openComponent(WorkspaceSourceDialog, {
-    templates: config.config.templates || []
-  });
-  if (!res) return;
-  if (res.source === "template") {
-    const tpl = (config.config.templates || []).find((x) => x.id === res.template);
-    return startCreateWorkspace(plugins, templatePrefill(tpl));
-  }
-  const info = res.info;
-  const matches = [];
-  for (const { github, branch } of info.branches || []) {
-    const repoName = github.split("/")[1];
-    const r = (config.config.repos || []).find((x) => (x.github || "").split("/")[1] === repoName);
-    if (!r || !r.path) continue;
-    const remote = github === r.github ? r.pull_remote || "origin" : r.push_remote || "dev";
-    matches.push({ repo: r, branch, remote });
-  }
-  if (!matches.length) {
-    dialogs.open({
-      title: "Workspace from bundle",
-      message: `none of the bundle's repositories (${(info.branches || []).map((b) => b.github).join(", ") || "none listed"}) match your configured repos`,
-      okLabel: "OK",
-      cancelLabel: null
-    });
-    return;
-  }
-  const results = await Promise.all(
-    matches.map(async (m2) => {
-      const eid = eventLog.begin(`fetching ${m2.branch} (${m2.repo.id}) from ${m2.remote}`);
-      try {
-        await postJSON("/api/code/remote-branch/fetch", {
-          path: m2.repo.path,
-          branch: m2.branch,
-          pull_remote: m2.remote
-        });
-        eventLog.finish(eid, "done");
-        return { ...m2, ok: true };
-      } catch (e) {
-        eventLog.finish(eid, "error");
-        return { ...m2, ok: false, error: e.message };
-      }
-    })
-  );
-  const failed = results.filter((r) => !r.ok);
-  if (failed.length) {
-    dialogs.error(
-      "Fetching bundle branches failed",
-      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n")
-    );
-    if (failed.length === results.length) return;
-  }
-  const got = results.filter((r) => r.ok);
-  await code.refreshBranches(new Set(got.map((m2) => m2.repo.id)));
-  return startCreateWorkspace(plugins, {
-    name: info.name,
-    config: repoBranchList.format(got.map((m2) => ({ repo: m2.repo.id, branch: m2.branch }))),
-    db: info.name,
-    template: "",
-    createBranches: false
-  });
-}
-async function startCreateWorkspace(plugins, prefill = {}) {
-  const { config, dialogs, db, code, eventLog, wt } = plugins;
-  await db.load();
-  const templates = config.config.templates || [];
-  const tpl = templates.find((t2) => t2.id === prefill.template) || null;
-  const existing = config.config.workspaces || [];
-  const dbNames = new Set(db.databases().map((d) => d.name));
-  const dbOptions = db.databases().map((d) => ({ value: d.name, label: d.name }));
-  const repoOptions = (config.config.repos || []).map((r) => ({ value: r.id, label: r.id }));
-  const prefillRepoIds = prefill.config ? repoBranchList.parse(prefill.config).map((c) => c.repo) : (config.config.repos || []).filter((r) => !r.external).map((r) => r.id);
-  const res = await dialogs.open({
-    title: tpl ? `New workspace \u2014 from template "${tpl.name}"` : "New workspace",
-    okLabel: "Create",
-    validate: (v) => {
-      const name = (v.name || "").trim();
-      if (!name) return "a name is required";
-      if (existing.some((w) => w.name === name))
-        return `a workspace named "${name}" already exists`;
-      if (!repoBranchList.parse((v.config || "").trim()).length) return "a config is required";
-      if (v.location === "worktree" && !tpl)
-        return "a worktree workspace needs a template \u2014 go back and pick one as the source";
-      if ((v.cloneDb || "") && !(v.db || "").trim())
-        return "set a database name to clone the selected database into";
-      if (v.location === "worktree" && v.cloneDb && dbNames.has((v.db || "").trim()))
-        return `database "${(v.db || "").trim()}" already exists \u2014 pick a new name to clone into`;
-      return "";
-    },
-    fields: [
-      {
-        key: "location",
-        type: "select",
-        label: "Location",
-        value: "main",
-        options: [
-          { value: "main", label: "Main checkout (one loaded at a time)" },
-          { value: "worktree", label: "Own worktree + port (runs concurrently)" }
-        ]
-      },
-      {
-        key: "name",
-        type: "text",
-        label: "Name",
-        value: prefill.name ?? "",
-        placeholder: "name (e.g. master-mytask)",
-        onChange: (newName, currentValues, oldValues) => {
-          const updates = { config: configFromRepos(currentValues.repos || [], newName.trim()) };
-          if (oldValues.name)
-            updates.db = (currentValues.db || "").replaceAll(oldValues.name, newName);
-          return updates;
-        }
-      },
-      {
-        key: "repos",
-        type: "repo-checks",
-        label: "Repositories",
-        value: prefillRepoIds,
-        options: repoOptions,
-        onChange: (repoIds, currentValues) => ({
-          config: configFromRepos(repoIds, (currentValues.name || "").trim())
-        })
-      },
-      {
-        key: "config",
-        type: "text",
-        label: "Config",
-        value: prefill.config ?? (prefill.name ? configFromRepos(prefillRepoIds, prefill.name.trim()) : ""),
-        placeholder: "community:master,enterprise:master"
-      },
-      {
-        key: "db",
-        type: "text",
-        label: "Database",
-        value: prefill.db ?? "",
-        placeholder: "database name"
-      },
-      {
-        key: "args",
-        type: "text",
-        label: "Start args",
-        value: prefill.args ?? "",
-        placeholder: "-i sale_management"
-      },
-      ...config.config.workspace_categories_enabled ? [
-        {
-          key: "category",
-          type: "select",
-          label: "Category",
-          placeholder: "\u2014 none \u2014",
-          options: categoryOptions(config),
-          value: prefill.category ?? ""
-        }
-      ] : [],
-      {
-        key: "cloneDb",
-        type: "check-select",
-        label: "Clone db",
-        options: dbOptions,
-        value: "",
-        default: () => {
-          if (tpl?.db && dbNames.has(tpl.db)) return tpl.db;
-          return dbOptions[0]?.value || "";
-        }
-      },
-      {
-        key: "demoData",
-        type: "checkbox",
-        label: "Demo data",
-        value: prefill.demoData ?? true
-      },
-      {
-        key: "createBranches",
-        type: "checkbox",
-        label: "Create branches (main)",
-        value: prefill.createBranches ?? true
-      },
-      { key: "activate", type: "checkbox", label: "Activate it (main)", value: true }
-    ]
-  });
-  if (!res) return;
-  const checkouts = repoBranchList.parse(res.config.trim());
-  const startPointByRepo = Object.fromEntries(
-    (tpl?.checkouts || []).map((c) => [c.repo, c.branch])
-  );
-  for (const c of checkouts)
-    if (!startPointByRepo[c.repo]) startPointByRepo[c.repo] = baseBranchOf(c.branch);
-  if (res.location === "worktree") {
-    await wt.createWorktree({
-      name: res.name.trim(),
-      dbName: (res.db || "").trim(),
-      cloneSource: res.cloneDb || "",
-      checkouts,
-      startPointByRepo,
-      baseId: tpl?.id || "",
-      on_create_args: (res.args || "").trim(),
-      demo_data: !!res.demoData,
-      favorite: false,
-      category: res.category || "",
-      parent: prefill.parent || ""
-    });
-    return;
-  }
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const ws = {
-    id: newWorkspaceId(),
-    name: res.name.trim(),
-    created_at: now,
-    last_activity: now,
-    favorite: false,
-    category: res.category || "",
-    parent: prefill.parent || "",
-    db: (res.db || "").trim(),
-    on_create_args: (res.args || "").trim(),
-    demo_data: !!res.demoData,
-    location: "main",
-    worktree: null,
-    port: null,
-    checkouts
-  };
-  eventLog.add(`creating workspace ${ws.name}`);
-  config.updateConfig({ workspaces: [...config.config.workspaces, ws] });
-  if (res.createBranches) {
-    const pathByRepo = Object.fromEntries(config.config.repos.map((r) => [r.id, r.path]));
-    await code.createBranches(
-      checkouts.map((c) => ({
-        path: pathByRepo[c.repo],
-        name: c.branch,
-        startPoint: startPointByRepo[c.repo],
-        freshStart: true
-      }))
-    );
-  }
-  if (res.activate) await config.workspace(ws.id)?.activate();
-  if (res.cloneDb && ws.db && res.cloneDb !== ws.db) {
-    await db.cloneStoppingServer(res.cloneDb, ws.db);
-  }
-  wt.select(ws.id);
-}
-function findSubWorkspace(config, parentWs, row) {
-  const isFwOnto = (branch) => typeof branch === "string" && branch.startsWith(`${row.branch}-`) && branch.endsWith("-fw");
-  return (config.config.workspaces || []).find(
-    (w) => w.parent === parentWs.id && (w.checkouts || []).some((c) => isFwOnto(c.branch))
-  ) || null;
-}
-async function createSubWorkspaceFromForwardPort(plugins, parentWs, row) {
-  const { config, dialogs, code, eventLog, wt } = plugins;
-  const existing = findSubWorkspace(config, parentWs, row);
-  if (existing) {
-    wt.select(existing.id);
-    return;
-  }
-  const repoFor = (slug) => {
-    const exact = (config.config.repos || []).find((r) => r.github === slug);
-    if (exact) return exact;
-    const name2 = slug.split("/")[1];
-    return (config.config.repos || []).find((r) => (r.github || "").split("/")[1] === name2) || null;
-  };
-  const targets = [];
-  for (const cell of row.cells || []) {
-    const repo = repoFor(cell.repository);
-    const pull = (cell.pulls || [])[0];
-    if (repo && repo.path && pull) targets.push({ repo, pull });
-  }
-  if (!targets.length) {
-    return dialogs.open({
-      title: "Create sub workspace",
-      message: `no forward-port PR here maps to a configured repo (${(row.cells || []).map((c) => c.repository).join(", ") || "none"})`,
-      okLabel: "OK",
-      cancelLabel: null
-    });
-  }
-  const results = await Promise.all(
-    targets.map(async ({ repo, pull }) => {
-      const eid = eventLog.begin(`fetching forward-port #${pull.number} (${repo.id})`);
-      try {
-        const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
-        const branch = head.branch;
-        if (!branch) throw new Error("could not resolve the PR's head branch");
-        await postJSON("/api/code/remote-branch/fetch", {
-          path: repo.path,
-          branch,
-          pull_remote: repo.push_remote || "dev"
-        });
-        eventLog.finish(eid, "done");
-        return { repo, branch, ok: true };
-      } catch (e) {
-        eventLog.finish(eid, "error");
-        return { repo, ok: false, error: e.message };
-      }
-    })
-  );
-  const failed = results.filter((r) => !r.ok);
-  if (failed.length) {
-    dialogs.error(
-      "Fetching forward-port branch failed",
-      failed.map((f) => `${f.repo.id}: ${f.error}`).join("\n")
-    );
-    if (failed.length === results.length) return;
-  }
-  const got = results.filter((r) => r.ok);
-  await code.refreshBranches(new Set(got.map((g) => g.repo.id)));
-  const name = got[0].branch;
-  return startCreateWorkspace(plugins, {
-    name,
-    config: repoBranchList.format(got.map((g) => ({ repo: g.repo.id, branch: g.branch }))),
-    db: name,
-    template: "",
-    createBranches: false,
-    parent: parentWs.id,
-    category: parentWs.category || ""
-  });
-}
-async function adoptCurrentCheckout(plugins) {
-  const { config, dialogs, code, eventLog, wt, server } = plugins;
-  const fail = (message) => dialogs.open({ title: "Adopt current checkout", message, okLabel: "OK", cancelLabel: null });
-  await code.loadBranches(/* @__PURE__ */ new Set(["community", "enterprise"]));
-  const byId = Object.fromEntries(code.branchRepos().map((r) => [r.id, r]));
-  const checkouts = [];
-  for (const id of ["community", "enterprise"]) {
-    const cur = byId[id]?.current;
-    if (cur && cur !== "(detached)") checkouts.push({ repo: id, branch: cur });
-  }
-  if (!checkouts.some((c) => c.repo === "community")) {
-    const why = code.error() ? ` (${code.error()})` : " (detached HEAD?)";
-    return fail(`couldn't read the community checkout${why} \u2014 check out a branch there first`);
-  }
-  const makeLoaded = async (ws2) => {
-    const s = server.status();
-    const busy = s.state === "running" || s.state === "starting";
-    const activeId = server.loadedWorkspaceId();
-    if (ws2.id === activeId) return;
-    if (busy) {
-      const running = (config.config.workspaces || []).find((w) => w.id === activeId);
-      const ok = await dialogs.open({
-        title: "Adopt current checkout",
-        message: `The main server is running${running ? ` workspace "${running.name}"` : ""} \u2014 stop it and make "${ws2.name}" the loaded workspace?`,
-        okLabel: "Stop & adopt"
-      });
-      if (!ok) return;
-      await server.stop();
-    }
-    server.setLastWorkspace(ws2.id);
-    config.workspace(ws2.id)?.touchActivity();
-  };
-  const existing = config.config.workspaces || [];
-  const match = existing.find(
-    (w) => w.location !== "worktree" && (w.checkouts || []).length > 0 && (w.checkouts || []).every(({ repo, branch }) => byId[repo]?.current === branch)
-  );
-  if (match) {
-    eventLog.add(`adopting current checkout \u2192 existing workspace ${match.name}`);
-    await makeLoaded(match);
-    wt.select(match.id);
-    return;
-  }
-  const feature = checkouts.map((c) => c.branch).find((b) => !BASE_BRANCH_RE.test(b)) || checkouts[0].branch;
-  let name = feature;
-  const names = new Set(existing.map((w) => w.name));
-  for (let i = 2; names.has(name); i++) name = `${feature}-${i}`;
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const ws = {
-    id: newWorkspaceId(),
-    name,
-    created_at: now,
-    last_activity: now,
-    favorite: false,
-    db: name,
-    on_create_args: "",
-    demo_data: true,
-    location: "main",
-    worktree: null,
-    port: null,
-    checkouts
-  };
-  eventLog.add(`creating workspace ${ws.name} from the current checkout`);
-  config.updateConfig({ workspaces: [...existing, ws] });
-  await makeLoaded(ws);
-  wt.select(ws.id);
-}
-async function deleteWorkspaceDialog(ws, { config, code, db, eventLog, repoMap, isActive, dialogs, wt, server }) {
-  if (isActive) return;
-  const descendants = descendantWorkspaces(config.config.workspaces || [], ws.id);
-  const groups = code.groups();
-  const branches = (ws.checkouts || []).map(({ repo, branch }) => ({ repo, branch, b: repoMap[repo]?.branches.get(branch) })).filter((x) => x.b && !BASE_BRANCH_RE.test(x.branch)).map((x) => ({
-    repo: x.repo,
-    branch: x.branch,
-    path: groups.pathByRepo[x.repo],
-    remote: !!x.b.remote
-  }));
-  const prs = (ws.checkouts || []).map(({ repo, branch }) => ({
-    pr: groups.prIndex[`${repo}:${branch}`],
-    github: groups.githubByRepo[repo]
-  })).filter((x) => x.pr && x.pr.state === "open" && x.github).map((x) => ({ github: x.github, number: x.pr.number }));
-  const fields2 = [];
-  if (branches.length)
-    fields2.push({
-      key: "delBranches",
-      type: "checkbox",
-      label: `Also delete ${branches.length === 1 ? "its branch" : `its ${branches.length} branches`}`,
-      value: true
-    });
-  if (branches.some((b) => b.remote))
-    fields2.push({
-      key: "delRemote",
-      type: "checkbox",
-      label: "\u2026also on the push remote",
-      value: true
-    });
-  if (prs.length)
-    fields2.push({
-      key: "closePrs",
-      type: "checkbox",
-      label: `Close ${prs.length === 1 ? "its open pull request" : `its ${prs.length} open pull requests`}`,
-      value: true
-    });
-  const dbExists = ws.db && db.databases().some((d) => d.name === ws.db);
-  if (dbExists)
-    fields2.push({
-      key: "dropDb",
-      type: "checkbox",
-      label: `Drop database "${ws.db}"`,
-      value: true
-    });
-  const res = await dialogs.open({
-    title: `Delete "${ws.name}"?`,
-    message: "The workspace will be removed from your list. This cannot be undone." + (descendants.length ? ` This also removes ${descendants.length} sub-workspace${descendants.length === 1 ? "" : "s"} spawned from it.` : ""),
-    okLabel: "Delete",
-    fields: fields2
-  });
-  if (!res) return;
-  eventLog.add(`deleting workspace ${ws.name}`);
-  const ops = [];
-  if (res.closePrs) for (const p of prs) ops.push(code.closePrNoConfirm(p.github, p.number));
-  if (res.delBranches)
-    for (const b of branches)
-      ops.push(code.deleteBranchNoConfirm(b.branch, b.repo, b.path, !!res.delRemote && b.remote));
-  if (res.dropDb && ws.db) ops.push(db.drop(ws.db));
-  await Promise.all(ops);
-  config.updateConfig({
-    workspaces: config.config.workspaces.filter((w) => w.id !== ws.id)
-  });
-  const { skipped } = await cascadeRemoveDescendants({ config, wt, eventLog, server }, ws);
-  if (skipped.length) {
-    await dialogs.open({
-      title: "Some sub-workspaces were kept",
-      message: skipped.map(
-        (w) => `"${w.name}" is still busy (its server is running, or it's the loaded workspace) \u2014 kept, no longer linked to the deleted parent.`
-      ).join("\n"),
-      okLabel: "OK",
-      cancelLabel: null
-    });
-  }
-}
 
 // static/src/workspaces_screen/claude_plugin.js
 var CLAUDE_MODELS = [
@@ -13335,6 +14007,7 @@ var Sidebar = class extends Component {
 var SCREENS = {
   workspaces: WorkspacesScreen,
   branches: BranchesScreen,
+  "review-queue": ReviewsScreen,
   todo: TodoScreen,
   databases: DatabasesScreen,
   nightly: NightlyScreen,
@@ -13348,6 +14021,7 @@ var App = class extends Component {
     Sidebar,
     WorkspacesScreen,
     BranchesScreen,
+    ReviewsScreen,
     TodoScreen,
     DatabasesScreen,
     NightlyScreen,
@@ -13429,7 +14103,8 @@ var PLUGINS = [
   ClaudePlugin,
   NightlyPlugin,
   MemoryPlugin,
-  CiPlugin
+  CiPlugin,
+  ReviewsPlugin
 ];
 async function boot() {
   await loadServerConfig();

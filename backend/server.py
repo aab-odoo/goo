@@ -1905,6 +1905,17 @@ def _api_prs_for_branches(body):
     return {"ok": True, "prs": prs}
 
 
+@post_route("/api/prs/info", "prs:list")
+def _api_prs_info(body):
+    return {"ok": True, "prs": GITHUB.pr_infos(body["prs"], refresh=bool(body.get("refresh")))}
+
+
+@post_route("/api/prs/review-status", "prs:list")
+def _api_prs_review_status(body):
+    statuses = GITHUB.review_statuses(body["prs"], refresh=bool(body.get("refresh")))
+    return {"ok": True, "statuses": statuses}
+
+
 @post_route("/api/prs/close", "repo", "number")
 def _api_prs_close(body):
     ok, error = GITHUB.close_pr(body["repo"], body["number"])
