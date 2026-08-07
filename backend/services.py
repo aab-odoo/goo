@@ -1478,8 +1478,10 @@ class NightlyService:
         client-side by runbot's JS from a <build-options-dropdown data-id
         data-log_list data-dest data-log_url> element, so we read those data
         attributes and construct the log URL directly rather than the
-        (JS-rendered, never-present-in-the-fetched-HTML) <a> links. Not
-        cached: a one-off user action, not a periodic poll."""
+        (JS-rendered, never-present-in-the-fetched-HTML) <a> links. Runbot
+        dropped the once-present `data-log_url` attribute, so the log host
+        is now built from `data-host` instead. Not cached: a one-off user
+        action, not a periodic poll."""
         if url.startswith("/"):
             url = f"{RUNBOT_BASE}{url}"
         html = self._fetch_html(url)
@@ -1497,14 +1499,14 @@ class NightlyService:
                 continue
             id_m = re.search(r'data-id="(\d+)"', attrs)
             dest_m = re.search(r'data-dest="([^"]*)"', attrs)
-            log_url_m = re.search(r'data-log_url="([^"]*)"', attrs)
-            if not id_m or not dest_m or not log_url_m:
+            host_m = re.search(r'data-host="([^"]*)"', attrs)
+            if not id_m or not dest_m or not host_m:
                 continue
             build_id = id_m.group(1)
             if build_id in seen:
                 continue
             seen.add(build_id)
-            log_url = html_lib.unescape(log_url_m.group(1))
+            log_url = f"https://{html_lib.unescape(host_m.group(1))}"
             dest = html_lib.unescape(dest_m.group(1))
             builds.append(
                 {
