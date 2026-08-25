@@ -13362,7 +13362,7 @@ var WorkspacesScreen = class extends Component {
                 <button class="dash-kebab" t-att-class="{open: this.menuOpen()}" title="more actions" t-on-click.stop="() => this.menuOpen.set(!this.menuOpen())"><t t-out="this.kebabIcon"/></button>
                 <div t-if="this.menuOpen()" class="dash-menu" t-on-click.stop="">
                   <button class="dash-menu-item" title="edit name / branches / database / args" t-on-click="() => this.headMenu(() => this.edit(this.sel))">Edit workspace…</button>
-                  <button class="dash-menu-item" t-att-title="this.archiveTitle(this.sel)" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
+                  <button class="dash-menu-item" t-att-disabled="this.archiveBlocked(this.sel)" t-att-title="this.archiveTitle(this.sel)" t-on-click="() => this.headMenu(() => this.toggleArchived(this.sel))" t-out="this.isArchived(this.sel) ? 'Unarchive workspace' : 'Archive workspace'"/>
                   <button class="dash-menu-item danger" t-att-disabled="!this.canDropDb(this.sel)" t-att-title="this.dropDbTitle(this.sel)" t-on-click="() => this.headMenu(() => this.dropDb(this.sel))">Drop database</button>
                   <button class="dash-menu-item danger" t-att-disabled="this.removeBlocked(this.sel)" t-att-title="this.removeTitle(this.sel)" t-on-click="() => this.headMenu(() => this.remove(this.sel))">Remove workspace</button>
                 </div>
@@ -13924,7 +13924,14 @@ var WorkspacesScreen = class extends Component {
   // by the list's runbot/mergebot polling. Unarchive returns to uncategorized.
   // Either way the whole sub-workspace subtree comes along (Workspace.setCategory).
   toggleArchived(ws) {
+    if (this.archiveBlocked(ws)) return;
     this.config.workspace(ws.id)?.setCategory(this.isArchived(ws) ? "" : ARCHIVED_CATEGORY);
+  }
+  // the loaded workspace is the active one — shelving what currently occupies the
+  // main checkout would hide it away. Unarchiving stays allowed either way, so one
+  // archived elsewhere (or before it was activated) can always be brought back.
+  archiveBlocked(ws) {
+    return !this.isArchived(ws) && this.isLoaded(ws);
   }
   // how many sub-workspaces this archive/unarchive carries along — unarchiving only
   // lifts the ones actually shelved with it (Workspace.setCategory)
@@ -13934,6 +13941,7 @@ var WorkspacesScreen = class extends Component {
   }
   // the kebab tooltip, naming the cascade so it isn't a surprise
   archiveTitle(ws) {
+    if (this.archiveBlocked(ws)) return "the active workspace cannot be archived";
     const n = this.archiveCascadeCount(ws);
     const also = n ? `, with its ${n} sub-workspace${n === 1 ? "" : "s"}` : "";
     return this.isArchived(ws) ? `move it back to uncategorized${also}` : `move it to the archived group${also} (keeps branches, db and settings)`;
