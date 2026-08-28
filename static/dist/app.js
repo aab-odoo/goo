@@ -99,6 +99,10 @@ var DEFAULT_CONFIG = {
   // checkout with a PR shows it merged (and nothing is dirty/unpushed) — once
   // a day (see backend/cleanup.py). Opt-in since it deletes things on its own.
   cleanup_enabled: false,
+  // off by default: when a PR is added in the Reviews screen, auto-create a
+  // worktree workspace for it (and any sibling PR auto-discovered on the same
+  // branch), in its own "review" category, without activating it.
+  auto_workspace_on_review: false,
   // the create-workspace dialog's Location field default: "main" (one loaded
   // at a time) or "worktree" (its own checkout, runs concurrently). Only the
   // dialog's own initial value — never overwrites what the user picks there.
@@ -3248,7 +3252,8 @@ var SETTINGS_BOOLS = [
   "workspace_categories_enabled",
   "autologin_links",
   "cleanup_enabled",
-  "docker_headed_browser"
+  "docker_headed_browser",
+  "auto_workspace_on_review"
 ];
 var SETTINGS_JSON = [
   "start",
@@ -3291,6 +3296,10 @@ var Settings = class extends Model {
   // off by default -- automatically deletes merged worktree workspaces once a
   // day (see backend/cleanup.py); opt-in since it deletes things on its own
   cleanup_enabled = fields.bool();
+  // off by default -- when a PR is added in the Reviews screen (including any
+  // sibling PR auto-discovered on the same branch), auto-create a worktree
+  // workspace for it (createReviewWorkspace, workspaces_screen/dialogs.js)
+  auto_workspace_on_review = fields.bool();
   // "local" | "docker" | "external" — see DEFAULT_CONFIG's comment (config.js).
   // Replaces the old hide_start_controls boolean (migrated in toModels below);
   // "docker"/"local" both get goo's own Start/Stop/logs/terminal, "external" hides them.
@@ -4502,7 +4511,8 @@ var WorkspacePlugin = class extends Plugin {
     category = "",
     parent = "",
     createVenv = false,
-    forkRepos = /* @__PURE__ */ new Set()
+    forkRepos = /* @__PURE__ */ new Set(),
+    select = true
   }) {
     if (!checkouts || !checkouts.length)
       return this._error("Create workspace", "the workspace has no checkouts");
@@ -4575,7 +4585,7 @@ var WorkspacePlugin = class extends Plugin {
       this.config.updateConfig({ workspaces: [...this.config.config.workspaces, ws] });
       this._merge(id, { exists: true, state: "stopped", port: null });
       this.eventLog.finish(eid, "done");
-      this.select(id);
+      if (select) this.select(id);
       return true;
     } catch (e) {
       this.eventLog.finish(eid, "error");
@@ -6990,6 +7000,10 @@ var ConfigScreen = class extends Component {
             <input id="setting-cleanup-enabled" type="checkbox" class="settings-check" title="Once a day, automatically delete a worktree workspace once every checkout with a PR shows it merged (skipped if anything is dirty or unpushed). Branches are only ever deleted locally, never on the remote."
                    t-att-checked="this.config.config.cleanup_enabled"
                    t-on-change="ev => this.config.updateConfig({ cleanup_enabled: ev.target.checked })"/>
+            <label for="setting-auto-workspace-on-review" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation.">auto-create workspace on review</label>
+            <input id="setting-auto-workspace-on-review" type="checkbox" class="settings-check" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation."
+                   t-att-checked="this.config.config.auto_workspace_on_review"
+                   t-on-change="ev => this.config.updateConfig({ auto_workspace_on_review: ev.target.checked })"/>
           </div>
         </div>
         <TabsEditor/>
@@ -10080,6 +10094,47 @@ async function createWorkspaceFromPRs(plugins, targets) {
     createBranches: false
   });
 }
+var REVIEW_CATEGORY = "review";
+async function createReviewWorkspace(plugins, targets) {
+  const { config } = plugins;
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
+  const name = got[0].branch;
+  const existing = (config.config.workspaces || []).some(
+    (w) => w.category === REVIEW_CATEGORY && w.name === name
+  );
+  if (existing) return;
+  if (!(config.config.workspace_categories || []).some((c) => c.id === REVIEW_CATEGORY)) {
+    config.updateConfig({
+      workspace_categories: [
+        ...config.config.workspace_categories || [],
+        { id: REVIEW_CATEGORY }
+      ]
+    });
+  }
+  const checkouts = got.map((g) => ({ repo: g.repo.id, branch: g.branch }));
+  const forkRepos = /* @__PURE__ */ new Set();
+  const startPointByRepo = {};
+  const mainRepoId = config.config.main_repo_id || "community";
+  if (!checkouts.some((c) => c.repo === mainRepoId)) {
+    const mainRepo = (config.config.repos || []).find((r) => r.id === mainRepoId && r.path);
+    if (mainRepo) {
+      checkouts.push({ repo: mainRepoId, branch: name });
+      forkRepos.add(mainRepoId);
+      startPointByRepo[mainRepoId] = baseBranchOf(name);
+    }
+  }
+  return plugins.wt.createWorktree({
+    name,
+    dbName: name,
+    cloneSource: "",
+    checkouts,
+    startPointByRepo,
+    forkRepos,
+    category: REVIEW_CATEGORY,
+    select: false
+  });
+}
 async function adoptCurrentCheckout(plugins) {
   const { config, dialogs, code, eventLog, wt, server } = plugins;
   const fail = (message) => dialogs.open({ title: "Adopt current checkout", message, okLabel: "OK", cancelLabel: null });
@@ -10543,18 +10598,24 @@ var ReviewsScreen = class extends Component {
       return;
     }
     this.addPrNote.set("");
-    await this.discoverSiblings(ref);
+    const { branch, siblings } = await this.discoverSiblings(ref);
+    if (branch && this.config.config.auto_workspace_on_review) {
+      const targets = [ref, ...siblings].map((p) => ({ repo: this._repoFor(p.github), pull: p })).filter((t2) => t2.repo && t2.repo.path);
+      if (targets.length) await createReviewWorkspace(this._dialogPlugins(), targets);
+    }
   }
   // once a PR is tracked, look for a sibling PR on the same branch in every
   // OTHER configured repo (the cross-repo task convention) and track those too
   // — so adding one PR of a multi-repo task picks up the rest automatically.
+  // Returns the resolved branch (null if it couldn't be resolved at all) and
+  // the newly-tracked siblings, so addPr can also drive auto-workspace-creation.
   async discoverSiblings(ref) {
     const info = await this.reviews.fetchOne(ref);
-    if (!info?.branch) return;
+    if (!info?.branch) return { branch: null, siblings: [] };
     const otherRepos = (this.config.config.repos || []).filter(
       (r) => r.github && r.github !== ref.github
     );
-    if (!otherRepos.length) return;
+    if (!otherRepos.length) return { branch: info.branch, siblings: [] };
     const siblings = await this.reviews.findSiblings(
       otherRepos.map((r) => ({ github: r.github, branch: info.branch }))
     );
@@ -10563,6 +10624,7 @@ var ReviewsScreen = class extends Component {
       this.addPrNote.set(
         `+${added.length} related PR${added.length === 1 ? "" : "s"} found on "${info.branch}"`
       );
+    return { branch: info.branch, siblings: added };
   }
   async refresh() {
     const tracked = this.config.config.reviews || [];
@@ -10605,7 +10667,10 @@ var ReviewsScreen = class extends Component {
     ]);
   }
   async createTaskWorkspace(rows) {
-    const targets = rows.map((row) => ({ repo: this._repoFor(row.github), pull: { github: row.github, number: row.number } })).filter((t2) => t2.repo && t2.repo.path);
+    const targets = rows.map((row) => ({
+      repo: this._repoFor(row.github),
+      pull: { github: row.github, number: row.number }
+    })).filter((t2) => t2.repo && t2.repo.path);
     if (!targets.length) return;
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
   }
@@ -10633,6 +10698,7 @@ var ReviewsScreen = class extends Component {
       this.config,
       rows.map((r) => r.id)
     );
+    await this._removeWorkspaceIfOrphaned(rows[0]?.branch);
   }
   // bulk-drop every task that's fully merged (base PR(s) + every forward port)
   // — the top bar's "Untrack all merged" button.
@@ -10650,6 +10716,20 @@ var ReviewsScreen = class extends Component {
       this.config,
       groups.flatMap((g) => g.rows.map((r) => r.id))
     );
+    await Promise.all(groups.map((g) => this._removeWorkspaceIfOrphaned(g.rows[0]?.branch)));
+  }
+  // drop the task's auto-created review workspace (createReviewWorkspace) once
+  // nothing tracked still shares its branch — untracking every PR in a task
+  // shouldn't leave its worktree/checkout behind forever. Skipped (does
+  // nothing) when another row on the same branch is still tracked (a
+  // multi-repo task untracked one row at a time via untrackRow) or when the
+  // workspace is busy (removeSilently itself no-ops then) — the untrack action
+  // was already confirmed, so this stays silent, same as cascade child removal.
+  async _removeWorkspaceIfOrphaned(branch) {
+    if (!branch) return;
+    if (this.allRows().some((r) => r.branch === branch)) return;
+    const ws = this.reviewWorkspaceFor(branch);
+    if (ws) await this.wt.removeSilently(ws);
   }
   // a task's (group header's) menu: Create workspace always; Open on GitHub /
   // Open on mergebot only for a single-PR task (ambiguous which PR otherwise —
@@ -10726,6 +10806,7 @@ var ReviewsScreen = class extends Component {
   async untrackRow(row) {
     if (!await this._confirmUntrack([row])) return;
     this.reviews.untrack(this.config, row.id);
+    await this._removeWorkspaceIfOrphaned(row.branch);
   }
 };
 

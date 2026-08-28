@@ -712,7 +712,7 @@ export function findSubWorkspace(config, parentWs, row) {
 // failures. A repo whose branch doesn't exist upstream yet just fails its own
 // fetch — the flow proceeds with whichever succeeded. Returns the successfully-
 // fetched {repo, branch} entries, or null if every target failed.
-async function resolvePrBranches(plugins, targets) {
+export async function resolvePrBranches(plugins, targets) {
   const { code, dialogs, eventLog } = plugins;
   const results = await Promise.all(
     targets.map(async ({ repo, pull }) => {
@@ -815,6 +815,72 @@ export async function createWorkspaceFromPRs(plugins, targets) {
     db: name,
     template: "",
     createBranches: false,
+  });
+}
+
+// Category auto-created review workspaces are tagged with (config.auto_workspace_on_review).
+// Not a reserved pseudo-category like ARCHIVED_CATEGORY — it only renders as its
+// own group once the user also enables workspace_categories_enabled, same as any
+// other category.
+export const REVIEW_CATEGORY = "review";
+
+// Headless counterpart to createWorkspaceFromPRs — no dialog, called automatically
+// when a PR (and any sibling PR auto-discovered on the same branch) is added in the
+// Reviews screen (see reviews.js addPr/discoverSiblings, gated on
+// config.auto_workspace_on_review). Always a worktree workspace, category "review",
+// attaching the already-fetched branches (createBranches: false) — never activated
+// (worktree workspaces never go through the main-checkout "activate" step) and
+// never stealing the current UI selection (select: false).
+// targets: [{repo, pull: {github, number}}], one per repo the task spans.
+export async function createReviewWorkspace(plugins, targets) {
+  const { config } = plugins;
+  const got = await resolvePrBranches(plugins, targets);
+  if (!got) return;
+  const name = got[0].branch;
+  // idempotent: a branch already added once (e.g. its first PR, before a sibling
+  // showed up) keeps its original workspace rather than spawning a duplicate.
+  const existing = (config.config.workspaces || []).some(
+    (w) => w.category === REVIEW_CATEGORY && w.name === name,
+  );
+  if (existing) return;
+  if (!(config.config.workspace_categories || []).some((c) => c.id === REVIEW_CATEGORY)) {
+    config.updateConfig({
+      workspace_categories: [
+        ...(config.config.workspace_categories || []),
+        { id: REVIEW_CATEGORY },
+      ],
+    });
+  }
+  const checkouts = got.map((g) => ({ repo: g.repo.id, branch: g.branch }));
+  const forkRepos = new Set();
+  const startPointByRepo = {};
+  // Claude always needs a main-repo (community) checkout to run in (its cwd —
+  // see ClaudePlugin._dirsFor) — a bundle-only PR (no sibling branch in the main
+  // repo, e.g. an enterprise-only change) would otherwise leave the review
+  // workspace without one. Can't just attach the stable series branch it derives
+  // from (18.0-foo-aab → 18.0): that branch is almost always already checked out
+  // in the main community checkout itself, and git worktree refuses to check out
+  // a branch that's live in another worktree. Fork a same-named branch off it
+  // instead — same fallback createWorkspaceFromPRs uses for a template-uncovered
+  // repo.
+  const mainRepoId = config.config.main_repo_id || "community";
+  if (!checkouts.some((c) => c.repo === mainRepoId)) {
+    const mainRepo = (config.config.repos || []).find((r) => r.id === mainRepoId && r.path);
+    if (mainRepo) {
+      checkouts.push({ repo: mainRepoId, branch: name });
+      forkRepos.add(mainRepoId);
+      startPointByRepo[mainRepoId] = baseBranchOf(name);
+    }
+  }
+  return plugins.wt.createWorktree({
+    name,
+    dbName: name,
+    cloneSource: "",
+    checkouts,
+    startPointByRepo,
+    forkRepos,
+    category: REVIEW_CATEGORY,
+    select: false,
   });
 }
 

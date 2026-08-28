@@ -90,6 +90,7 @@ const SETTINGS_BOOLS = [
   "autologin_links",
   "cleanup_enabled",
   "docker_headed_browser",
+  "auto_workspace_on_review",
 ];
 const SETTINGS_JSON = [
   "start",
@@ -133,6 +134,10 @@ export class Settings extends Model {
   // off by default -- automatically deletes merged worktree workspaces once a
   // day (see backend/cleanup.py); opt-in since it deletes things on its own
   cleanup_enabled = fields.bool();
+  // off by default -- when a PR is added in the Reviews screen (including any
+  // sibling PR auto-discovered on the same branch), auto-create a worktree
+  // workspace for it (createReviewWorkspace, workspaces_screen/dialogs.js)
+  auto_workspace_on_review = fields.bool();
   // "local" | "docker" | "external" — see DEFAULT_CONFIG's comment (config.js).
   // Replaces the old hide_start_controls boolean (migrated in toModels below);
   // "docker"/"local" both get goo's own Start/Stop/logs/terminal, "external" hides them.

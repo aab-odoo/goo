@@ -68,6 +68,10 @@ export const DEFAULT_CONFIG = {
   // checkout with a PR shows it merged (and nothing is dirty/unpushed) — once
   // a day (see backend/cleanup.py). Opt-in since it deletes things on its own.
   cleanup_enabled: false,
+  // off by default: when a PR is added in the Reviews screen, auto-create a
+  // worktree workspace for it (and any sibling PR auto-discovered on the same
+  // branch), in its own "review" category, without activating it.
+  auto_workspace_on_review: false,
   // the create-workspace dialog's Location field default: "main" (one loaded
   // at a time) or "worktree" (its own checkout, runs concurrently). Only the
   // dialog's own initial value — never overwrites what the user picks there.
