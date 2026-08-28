@@ -32,6 +32,134 @@ export function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Claude's own merge-readiness guess (0-100) reported at the end of a review
+// turn, if any. A review run always ends its prompt with a fixed, non-editable
+// instruction to report one as "Score: N/100" (see REVIEW_SCORE_INSTRUCTION,
+// workspaces_screen/dialogs.js), so this needs no dedicated backend field.
+// Returns the LAST one found in `text` (a later re-review after changes wins
+// when the caller feeds it the whole conversation), or null if none was ever
+// reported (an older review, a non-review chat, or Claude just didn't comply).
+export function parseReviewScore(text) {
+  const re = /score\s*:\s*(\d{1,3})\s*\/\s*100/gi;
+  let score = null;
+  let m;
+  while ((m = re.exec(text || ""))) score = Math.max(0, Math.min(100, Number(m[1])));
+  return score;
+}
+
+// the little colored badge's variant for a review score — shared by the Reviews
+// screen's group-header button and ReviewPanel's header.
+export function reviewScoreClass(score) {
+  if (score >= 70) return "high";
+  if (score >= 40) return "mid";
+  return "low";
+}
+
+// inline markdown spans (code/links/bold/italic) within one already-escaped line
+// of text — order matters: code spans first (so **/_ inside `code` are left
+// alone), then links, then bold before italic (so "**x**" isn't read as
+// italic-of-"*x*").
+function inlineMd(text) {
+  let s = escapeHtml(text);
+  s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
+  s = s.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, label, url) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`,
+  );
+  s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>");
+  return s;
+}
+
+// a small, dependency-free markdown → HTML renderer for Claude's review replies
+// (headings, bold/italic/inline-code, fenced code blocks, bullet/numbered lists,
+// blockquotes, hr, links, paragraphs) — goo stays free of runtime npm packages
+// (see package.json: everything there is a devDependency), so this covers the
+// common subset rather than pulling in a full markdown library. The result is
+// only ever passed through owl's `markup()` by the caller, never inserted as
+// raw HTML on its own — every text run goes through escapeHtml first (in
+// inlineMd, or directly for code-fence bodies).
+export function mdToHtml(text) {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let para = [];
+  let list = null; // { type: "ul"|"ol", items: [...] }
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${inlineMd(para.join(" "))}</p>`);
+    para = [];
+  };
+  const flushList = () => {
+    if (!list) return;
+    const items = list.items.map((it) => `<li>${inlineMd(it)}</li>`).join("");
+    out.push(`<${list.type}>${items}</${list.type}>`);
+    list = null;
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flushPara();
+      flushList();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) body.push(lines[i++]);
+      i++; // skip the closing fence
+      out.push(`<pre class="md-code"><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushPara();
+      flushList();
+      out.push(`<h${heading[1].length}>${inlineMd(heading[2].trim())}</h${heading[1].length}>`);
+      i++;
+      continue;
+    }
+    if (/^(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      flushList();
+      out.push("<hr/>");
+      i++;
+      continue;
+    }
+    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ul || ol) {
+      flushPara();
+      const type = ul ? "ul" : "ol";
+      if (!list || list.type !== type) {
+        flushList();
+        list = { type, items: [] };
+      }
+      list.items.push((ul || ol)[1]);
+      i++;
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      flushPara();
+      flushList();
+      const quote = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote><p>${inlineMd(quote.join(" "))}</p></blockquote>`);
+      continue;
+    }
+    if (line.trim() === "") {
+      flushPara();
+      flushList();
+      i++;
+      continue;
+    }
+    flushList();
+    para.push(line.trim());
+    i++;
+  }
+  flushPara();
+  flushList();
+  return out.join("\n");
+}
+
 export function tintCmd(cmd) {
   const tokens = cmd.split(" ").map((tok) => {
     const esc = escapeHtml(tok);
@@ -204,6 +332,19 @@ export async function postJSON(path, body) {
     throw err;
   }
   return data;
+}
+
+// The Claude review prompt template — a real .md file on disk (not part of the
+// reactive config blob), edited in the Configuration screen and read fresh at
+// review time (workspaces_screen/dialogs.js's runClaudeReview).
+export async function fetchReviewPrompt() {
+  const res = await fetch("/api/review-prompt");
+  const data = await res.json().catch(() => ({}));
+  return data.content || "";
+}
+
+export async function saveReviewPrompt(content) {
+  return postJSON("/api/review-prompt", { content });
 }
 
 // filesystem-safe folder name for a worktree target (case-preserving; falls back

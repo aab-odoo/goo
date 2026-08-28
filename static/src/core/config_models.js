@@ -91,6 +91,7 @@ const SETTINGS_BOOLS = [
   "cleanup_enabled",
   "docker_headed_browser",
   "auto_workspace_on_review",
+  "auto_claude_review",
 ];
 const SETTINGS_JSON = [
   "start",
@@ -138,6 +139,11 @@ export class Settings extends Model {
   // sibling PR auto-discovered on the same branch), auto-create a worktree
   // workspace for it (createReviewWorkspace, workspaces_screen/dialogs.js)
   auto_workspace_on_review = fields.bool();
+  // off by default, nested under auto_workspace_on_review -- also auto-run a
+  // Claude review (runClaudeReview, workspaces_screen/dialogs.js) in the
+  // freshly-created review workspace. The manual "Review" action in the
+  // Reviews screen works regardless of this setting.
+  auto_claude_review = fields.bool();
   // "local" | "docker" | "external" — see DEFAULT_CONFIG's comment (config.js).
   // Replaces the old hide_start_controls boolean (migrated in toModels below);
   // "docker"/"local" both get goo's own Start/Stop/logs/terminal, "external" hides them.

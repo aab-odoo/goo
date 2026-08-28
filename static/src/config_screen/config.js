@@ -15,7 +15,7 @@ import { EventLogPlugin } from "../core/event_log_plugin.js";
 import { UpdatePlugin } from "../core/update_plugin.js";
 import { ICONS, NAV, m, mergedTabIds } from "../core/common.js";
 import { startRowDrag, dropIndex } from "../core/drag.js";
-import { postJSON, repoBranchList } from "../core/utils.js";
+import { postJSON, repoBranchList, fetchReviewPrompt, saveReviewPrompt } from "../core/utils.js";
 import { Panel } from "../core/panel.js";
 
 export class ListEditor extends Component {
@@ -686,7 +686,20 @@ export class ConfigScreen extends Component {
             <input id="setting-auto-workspace-on-review" type="checkbox" class="settings-check" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation."
                    t-att-checked="this.config.config.auto_workspace_on_review"
                    t-on-change="ev => this.config.updateConfig({ auto_workspace_on_review: ev.target.checked })"/>
+            <t t-if="this.config.config.auto_workspace_on_review">
+              <label for="setting-auto-claude-review" title="Also auto-run a Claude review (using the prompt template below) in the freshly-created review workspace. The manual &quot;Review&quot; action in the Reviews screen works regardless of this setting.">auto-run Claude review</label>
+              <input id="setting-auto-claude-review" type="checkbox" class="settings-check" title="Also auto-run a Claude review (using the prompt template below) in the freshly-created review workspace. The manual &quot;Review&quot; action in the Reviews screen works regardless of this setting."
+                     t-att-checked="this.config.config.auto_claude_review"
+                     t-on-change="ev => this.config.updateConfig({ auto_claude_review: ev.target.checked })"/>
+            </t>
           </div>
+        </div>
+        <div class="config-block">
+          <h2 class="subtitle">Claude review prompt</h2>
+          <p class="dim">Used by both the automatic and the manual "Review" action in the Reviews screen. A fixed safety preamble (no push, no PR mutation) is always prepended and isn't editable here. {{branch}} and {{repos}} are substituted at run time. Stored as a plain .md file on disk (~/.config/goo/review_prompt.md), not in this config.</p>
+          <textarea class="review-prompt-input" rows="8" placeholder="Review prompt template…"
+                    t-att-value="this.reviewPromptText()"
+                    t-on-input="ev => this.onReviewPromptInput(ev.target.value)"/>
         </div>
         <TabsEditor/>
         <ListEditor kind="'repos'"/>
@@ -726,6 +739,11 @@ export class ConfigScreen extends Component {
   rustBuilding = signal(false);
   rustStatus = signal({ checking: true });
   settings = signal(this._loadSettings());
+  // the Claude review prompt template — a real .md file on disk, not part of the
+  // reactive config blob, so it's fetched/saved through its own tiny endpoint
+  // (core/utils.js fetchReviewPrompt/saveReviewPrompt) rather than updateConfig.
+  reviewPromptText = signal("");
+  _reviewPromptTimer = null;
 
   // editor lives in Miscellaneous, not this grid; the rest are filtered to the
   // active launch_mode (a field with no `modes` — none left today besides
@@ -739,6 +757,14 @@ export class ConfigScreen extends Component {
 
   setup() {
     onMounted(() => this.checkRustBundler());
+    onMounted(() => fetchReviewPrompt().then((c) => this.reviewPromptText.set(c)));
+    onWillUnmount(() => clearTimeout(this._reviewPromptTimer));
+  }
+
+  onReviewPromptInput(value) {
+    this.reviewPromptText.set(value);
+    clearTimeout(this._reviewPromptTimer);
+    this._reviewPromptTimer = setTimeout(() => saveReviewPrompt(this.reviewPromptText()), 800);
   }
 
   get rustStatusText() {

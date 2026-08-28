@@ -103,6 +103,11 @@ var DEFAULT_CONFIG = {
   // worktree workspace for it (and any sibling PR auto-discovered on the same
   // branch), in its own "review" category, without activating it.
   auto_workspace_on_review: false,
+  // off by default, nested under auto_workspace_on_review: also auto-run a
+  // Claude review in the freshly-created review workspace, using the
+  // review_prompt.md template (edited in the Configuration screen). The manual
+  // "Review" action in the Reviews screen works regardless of this setting.
+  auto_claude_review: false,
   // the create-workspace dialog's Location field default: "main" (one loaded
   // at a time) or "worktree" (its own checkout, runs concurrently). Only the
   // dialog's own initial value — never overwrites what the user picks there.
@@ -398,6 +403,109 @@ function formatBytes(n) {
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+function parseReviewScore(text) {
+  const re = /score\s*:\s*(\d{1,3})\s*\/\s*100/gi;
+  let score = null;
+  let m2;
+  while (m2 = re.exec(text || "")) score = Math.max(0, Math.min(100, Number(m2[1])));
+  return score;
+}
+function reviewScoreClass(score) {
+  if (score >= 70) return "high";
+  if (score >= 40) return "mid";
+  return "low";
+}
+function inlineMd(text) {
+  let s = escapeHtml(text);
+  s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
+  s = s.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, label, url) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`
+  );
+  s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>");
+  return s;
+}
+function mdToHtml(text) {
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let para = [];
+  let list = null;
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${inlineMd(para.join(" "))}</p>`);
+    para = [];
+  };
+  const flushList = () => {
+    if (!list) return;
+    const items = list.items.map((it) => `<li>${inlineMd(it)}</li>`).join("");
+    out.push(`<${list.type}>${items}</${list.type}>`);
+    list = null;
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flushPara();
+      flushList();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) body.push(lines[i++]);
+      i++;
+      out.push(`<pre class="md-code"><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushPara();
+      flushList();
+      out.push(`<h${heading[1].length}>${inlineMd(heading[2].trim())}</h${heading[1].length}>`);
+      i++;
+      continue;
+    }
+    if (/^(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      flushList();
+      out.push("<hr/>");
+      i++;
+      continue;
+    }
+    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ul || ol) {
+      flushPara();
+      const type = ul ? "ul" : "ol";
+      if (!list || list.type !== type) {
+        flushList();
+        list = { type, items: [] };
+      }
+      list.items.push((ul || ol)[1]);
+      i++;
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      flushPara();
+      flushList();
+      const quote = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote><p>${inlineMd(quote.join(" "))}</p></blockquote>`);
+      continue;
+    }
+    if (line.trim() === "") {
+      flushPara();
+      flushList();
+      i++;
+      continue;
+    }
+    flushList();
+    para.push(line.trim());
+    i++;
+  }
+  flushPara();
+  flushList();
+  return out.join("\n");
+}
 var ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 var LOG_RE = /^(?:\d{4}-\d{2}-\d{2} )?(\d{2}:\d{2}:\d{2},\d+) (\d+) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (\S+) ([\w.]+): (.*)$/;
 var HTTP_RE = /^(.*?)"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) ([^"]*) (HTTP\/[\d.]+)" (\d{3}) ?(.*)$/;
@@ -520,6 +628,14 @@ async function postJSON(path, body) {
     throw err;
   }
   return data;
+}
+async function fetchReviewPrompt() {
+  const res = await fetch("/api/review-prompt");
+  const data = await res.json().catch(() => ({}));
+  return data.content || "";
+}
+async function saveReviewPrompt(content) {
+  return postJSON("/api/review-prompt", { content });
 }
 function worktreeSlug(tgt) {
   const s = (tgt.name || tgt.id || "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -3253,7 +3369,8 @@ var SETTINGS_BOOLS = [
   "autologin_links",
   "cleanup_enabled",
   "docker_headed_browser",
-  "auto_workspace_on_review"
+  "auto_workspace_on_review",
+  "auto_claude_review"
 ];
 var SETTINGS_JSON = [
   "start",
@@ -3300,6 +3417,11 @@ var Settings = class extends Model {
   // sibling PR auto-discovered on the same branch), auto-create a worktree
   // workspace for it (createReviewWorkspace, workspaces_screen/dialogs.js)
   auto_workspace_on_review = fields.bool();
+  // off by default, nested under auto_workspace_on_review -- also auto-run a
+  // Claude review (runClaudeReview, workspaces_screen/dialogs.js) in the
+  // freshly-created review workspace. The manual "Review" action in the
+  // Reviews screen works regardless of this setting.
+  auto_claude_review = fields.bool();
   // "local" | "docker" | "external" — see DEFAULT_CONFIG's comment (config.js).
   // Replaces the old hide_start_controls boolean (migrated in toModels below);
   // "docker"/"local" both get goo's own Start/Stop/logs/terminal, "external" hides them.
@@ -4586,7 +4708,7 @@ var WorkspacePlugin = class extends Plugin {
       this._merge(id, { exists: true, state: "stopped", port: null });
       this.eventLog.finish(eid, "done");
       if (select) this.select(id);
-      return true;
+      return id;
     } catch (e) {
       this.eventLog.finish(eid, "error");
       return this._error("Workspace creation failed", e.message);
@@ -7004,7 +7126,20 @@ var ConfigScreen = class extends Component {
             <input id="setting-auto-workspace-on-review" type="checkbox" class="settings-check" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation."
                    t-att-checked="this.config.config.auto_workspace_on_review"
                    t-on-change="ev => this.config.updateConfig({ auto_workspace_on_review: ev.target.checked })"/>
+            <t t-if="this.config.config.auto_workspace_on_review">
+              <label for="setting-auto-claude-review" title="Also auto-run a Claude review (using the prompt template below) in the freshly-created review workspace. The manual &quot;Review&quot; action in the Reviews screen works regardless of this setting.">auto-run Claude review</label>
+              <input id="setting-auto-claude-review" type="checkbox" class="settings-check" title="Also auto-run a Claude review (using the prompt template below) in the freshly-created review workspace. The manual &quot;Review&quot; action in the Reviews screen works regardless of this setting."
+                     t-att-checked="this.config.config.auto_claude_review"
+                     t-on-change="ev => this.config.updateConfig({ auto_claude_review: ev.target.checked })"/>
+            </t>
           </div>
+        </div>
+        <div class="config-block">
+          <h2 class="subtitle">Claude review prompt</h2>
+          <p class="dim">Used by both the automatic and the manual "Review" action in the Reviews screen. A fixed safety preamble (no push, no PR mutation) is always prepended and isn't editable here. {{branch}} and {{repos}} are substituted at run time. Stored as a plain .md file on disk (~/.config/goo/review_prompt.md), not in this config.</p>
+          <textarea class="review-prompt-input" rows="8" placeholder="Review prompt template…"
+                    t-att-value="this.reviewPromptText()"
+                    t-on-input="ev => this.onReviewPromptInput(ev.target.value)"/>
         </div>
         <TabsEditor/>
         <ListEditor kind="'repos'"/>
@@ -7044,6 +7179,11 @@ var ConfigScreen = class extends Component {
   rustBuilding = signal(false);
   rustStatus = signal({ checking: true });
   settings = signal(this._loadSettings());
+  // the Claude review prompt template — a real .md file on disk, not part of the
+  // reactive config blob, so it's fetched/saved through its own tiny endpoint
+  // (core/utils.js fetchReviewPrompt/saveReviewPrompt) rather than updateConfig.
+  reviewPromptText = signal("");
+  _reviewPromptTimer = null;
   // editor lives in Miscellaneous, not this grid; the rest are filtered to the
   // active launch_mode (a field with no `modes` — none left today besides
   // editor — would show in every mode)
@@ -7055,6 +7195,13 @@ var ConfigScreen = class extends Component {
   }
   setup() {
     onMounted(() => this.checkRustBundler());
+    onMounted(() => fetchReviewPrompt().then((c) => this.reviewPromptText.set(c)));
+    onWillUnmount(() => clearTimeout(this._reviewPromptTimer));
+  }
+  onReviewPromptInput(value) {
+    this.reviewPromptText.set(value);
+    clearTimeout(this._reviewPromptTimer);
+    this._reviewPromptTimer = setTimeout(() => saveReviewPrompt(this.reviewPromptText()), 800);
   }
   get rustStatusText() {
     const status = this.rustStatus();
@@ -9395,6 +9542,172 @@ var CiScreen = class extends Component {
   }
 };
 
+// static/src/workspaces_screen/claude_plugin.js
+var CLAUDE_MODELS = [
+  { value: "", label: "Default model" },
+  { value: "opus[1m]", label: "Opus 4.8 \xB7 1M" },
+  { value: "opus", label: "Opus 4.8" },
+  { value: "sonnet", label: "Sonnet 5" },
+  { value: "haiku", label: "Haiku 4.5" }
+];
+var ClaudePlugin = class extends Plugin {
+  static sequence = 6;
+  // after WorkspacePlugin (5), whose wtRepos() it reuses
+  config = usePlugin(ConfigPlugin);
+  server = usePlugin(ServerPlugin);
+  worktree = usePlugin(WorkspacePlugin);
+  eventLog = usePlugin(EventLogPlugin);
+  dialogs = usePlugin(DialogPlugin);
+  convos = signal({});
+  // targetId -> { items: [...], state: "idle"|"running" }
+  models = CLAUDE_MODELS;
+  model = signal(this.config.getState("claude_model", ""));
+  // chosen model, persisted
+  _primed = /* @__PURE__ */ new Set();
+  // targets whose transcript we've fetched from the backend
+  setup() {
+    this.server.onClaude((d) => this.apply(d));
+  }
+  setModel(v) {
+    this.model.set(v || "");
+    this.config.setState("claude_model", v || "");
+  }
+  _get(id) {
+    return this.convos()[id] || { items: [], state: "idle" };
+  }
+  _set(id, next) {
+    this.convos.set({ ...this.convos(), [id]: next });
+  }
+  _append(id, item) {
+    const c = this._get(id);
+    this._set(id, { ...c, items: [...c.items, item] });
+  }
+  items(id) {
+    return this._get(id).items;
+  }
+  running(id) {
+    return this._get(id).state === "running";
+  }
+  // the merge-readiness score (0-100) Claude reported at the end of a review
+  // turn, if any — parsed from the conversation's own assistant text. A review
+  // run always ends its prompt with a fixed, non-editable instruction to report
+  // one as "Score: N/100" (see REVIEW_SCORE_INSTRUCTION, workspaces_screen/
+  // dialogs.js), so this needs no dedicated backend field. Returns the LAST one
+  // found across the conversation (a later re-review after changes wins), or
+  // null if none was ever reported (an older review, a non-review chat, or
+  // Claude just didn't comply).
+  reviewScore(id) {
+    let score = null;
+    for (const item of this.items(id)) {
+      if (item.role !== "assistant" || !item.text) continue;
+      const s = parseReviewScore(item.text);
+      if (s !== null) score = s;
+    }
+    return score;
+  }
+  // a live chat item pushed from the backend (assistant text, tool activity, result,
+  // or error). The final "result" ends the turn — flip back to idle.
+  apply(d) {
+    if (!d || !d.workspace) return;
+    const id = d.workspace;
+    if (d.role === "result") {
+      const c = this._get(id);
+      if (!d.ok && d.error) this._set(id, { ...c, items: [...c.items, d], state: "idle" });
+      else this._set(id, { ...c, state: "idle" });
+      return;
+    }
+    this._append(id, d);
+  }
+  // fetch the transcript once per target (after a reload the backend still holds it);
+  // skip if we already have live items so an in-flight turn isn't clobbered
+  async prime(id) {
+    if (!id || this._primed.has(id)) return;
+    this._primed.add(id);
+    if (this._get(id).items.length) return;
+    try {
+      const res = await postJSON("/api/workspace/claude/history", { workspace: id });
+      this._set(id, { items: res.items || [], state: res.state || "idle" });
+    } catch {
+    }
+  }
+  // the raw persisted review markdown for <id> (backend's ClaudeManager.review_text),
+  // straight from disk regardless of in-memory conversation state — used by the
+  // Reviews screen's "open review" panel. Always re-fetched (no once-guard like
+  // prime()), since this is opened on demand rather than primed for every visible
+  // task.
+  async fetchReviewText(id) {
+    try {
+      const res = await postJSON("/api/workspace/claude/review", { workspace: id });
+      return res.text || "";
+    } catch {
+      return "";
+    }
+  }
+  // where Claude works for <tgt>: a worktree workspace's own checkout copies, or —
+  // for a main-located workspace (the screen only offers it when loaded) — the REAL
+  // main checkout paths. Returns { cwd, addDirs } or null (error already shown).
+  // Note: removing a main-located workspace never CLAUDE.forgets its transcript
+  // (only /api/workspace/remove does) — a harmless stale in-memory convo.
+  _dirsFor(tgt) {
+    const mainRepoId = this.config.config.main_repo_id || "community";
+    if (this.worktree.isWorktree(tgt)) {
+      const repos = this.worktree.wtRepos(tgt);
+      const main = repos.find((r) => r.repo === mainRepoId);
+      if (!main) {
+        this.dialogs.error("Cannot run Claude", "this worktree has no main repo checkout");
+        return null;
+      }
+      return {
+        cwd: main.worktreePath,
+        addDirs: repos.filter((r) => r.repo !== mainRepoId).map((r) => r.worktreePath)
+      };
+    }
+    const pathById = Object.fromEntries(this.config.config.repos.map((r) => [r.id, r.path]));
+    const cwd = pathById[mainRepoId];
+    if (!cwd) {
+      this.dialogs.error("Cannot run Claude", "no main repo configured");
+      return null;
+    }
+    const addDirs = (tgt.checkouts || []).filter((c) => c.repo !== mainRepoId).map((c) => pathById[c.repo]).filter(Boolean);
+    return { cwd, addDirs };
+  }
+  // send a task to Claude for <tgt>, running in its checkout (worktree copies, or
+  // the main checkout for a loaded main-located workspace) with the workspace's
+  // other repos added as extra allowed dirs. `review: true` (a review run — see
+  // dialogs.js's runClaudeReview) tells the backend to save this turn's reply to
+  // disk on completion, so it survives a goo restart (an ordinary chat turn stays
+  // in-memory only, as before).
+  async send(tgt, prompt, { review = false } = {}) {
+    const text = (prompt || "").trim();
+    if (!text || this.running(tgt.id)) return;
+    const dirs = this._dirsFor(tgt);
+    if (!dirs) return;
+    this.config.workspace(tgt.id)?.touchActivity();
+    this._append(tgt.id, { role: "user", text });
+    this._set(tgt.id, { ...this._get(tgt.id), state: "running" });
+    try {
+      await postJSON("/api/workspace/claude", {
+        workspace: tgt.id,
+        prompt: text,
+        cwd: dirs.cwd,
+        addDirs: dirs.addDirs,
+        model: this.model() || void 0,
+        review
+      });
+    } catch (e) {
+      this._append(tgt.id, { role: "error", text: e.message });
+      this._set(tgt.id, { ...this._get(tgt.id), state: "idle" });
+    }
+  }
+  async stop(tgt) {
+    try {
+      await postJSON("/api/workspace/claude/stop", { workspace: tgt.id });
+    } catch {
+    }
+    this._set(tgt.id, { ...this._get(tgt.id), state: "idle" });
+  }
+};
+
 // static/src/reviews_screen/reviews_plugin.js
 var ReviewsPlugin = class extends Plugin {
   static sequence = 4;
@@ -9512,6 +9825,88 @@ var ReviewsPlugin = class extends Plugin {
   }
 };
 
+// static/src/reviews_screen/review_panel.js
+var ReviewPanel = class extends Component {
+  static template = xml`
+    <div class="term-panel review-panel" t-ref="this.drag.handle">
+      <div class="term-panel-head" t-on-mousedown="this.drag.onDragStart">
+        <div class="review-panel-head-left">
+          <span class="term-panel-title" t-out="this.props.label"/>
+          <span t-if="this.score() !== null" class="rev-score" t-att-class="this.scoreClass()" t-out="this.score()"/>
+        </div>
+        <button class="event-log-x" title="close" t-on-click="() => this.done(null)">✕</button>
+      </div>
+      <div class="review-panel-body">
+        <div t-if="this.loading()" class="commits-empty">loading…</div>
+        <div t-elif="!this.text()" class="commits-empty">no review saved for this task yet</div>
+        <div t-else="" class="review-panel-text" t-out="this.html()"/>
+      </div>
+      <div class="review-panel-foot">
+        <button class="pbtn primary" t-on-click="() => this.continueToChat()">Continue to chat with claude</button>
+      </div>
+      <div class="term-panel-resize" t-on-mousedown="this.drag.onResizeStart"/>
+    </div>`;
+  props = useProps({ done: t.function(), workspaceId: t.string(), label: t.string() });
+  claude = usePlugin(ClaudePlugin);
+  wt = usePlugin(WorkspacePlugin);
+  router = usePlugin(RouterPlugin);
+  text = signal("");
+  loading = signal(true);
+  setup() {
+    this.drag = useDragResize({
+      w: 640,
+      h: 620,
+      place: (w, h) => ({
+        x: Math.max(0, window.innerWidth - w - 16),
+        y: Math.max(0, Math.floor((window.innerHeight - h) / 2))
+      })
+    });
+    onMounted(() => this.load());
+    const onKey = (e) => {
+      if (e.key === "Escape") this.done(null);
+    };
+    document.addEventListener("keydown", onKey);
+    onWillUnmount(() => document.removeEventListener("keydown", onKey));
+  }
+  async load() {
+    this.loading.set(true);
+    try {
+      this.text.set(await this.claude.fetchReviewText(this.props.workspaceId));
+    } finally {
+      this.loading.set(false);
+    }
+  }
+  // rendered once per text change, not cached — reviews are short enough that
+  // re-parsing on every render is a non-issue, and a signal-backed getter would
+  // just be more code for the same effect.
+  html() {
+    return markup(mdToHtml(this.text()));
+  }
+  // Claude's own merge-readiness guess (0-100), parsed straight from the saved
+  // review text — same "Score: N/100" convention as the group-header badge
+  // (ClaudePlugin.reviewScore), just read off this panel's own fetched text
+  // instead of the live conversation.
+  score() {
+    return parseReviewScore(this.text());
+  }
+  scoreClass() {
+    return reviewScoreClass(this.score());
+  }
+  done(result) {
+    this.props.done(result);
+  }
+  // jump to the workspace's own Claude tab for the full transcript (tool calls,
+  // the original prompt, etc.) — this panel only ever shows the saved review
+  // text itself. Closes the panel first since the dialog container stays
+  // mounted across screen navigation and would otherwise keep floating there.
+  continueToChat() {
+    this.wt.selectOnOpen(this.props.workspaceId);
+    this.wt.requestedPane.set("claude");
+    this.router.go("workspaces");
+    this.done(null);
+  }
+};
+
 // static/src/workspaces_screen/dialogs.js
 function categoryOptions(config) {
   const opts = (config.config.workspace_categories || []).map((c) => ({
@@ -9526,8 +9921,7 @@ var configFromRepos = (repoIds, branch, currentConfig = "", preserveExisting = f
   const existing = preserveExisting ? Object.fromEntries(repoBranchList.parse(currentConfig).map((c) => [c.repo, c.branch])) : {};
   return repoBranchList.format(repoIds.map((repo) => ({ repo, branch: existing[repo] ?? branch })));
 };
-async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
-  const attempt = (force) => postJSON("/api/code/remote-branch/fetch", { path, branch, pull_remote, force });
+async function _fetchWithOverwritePrompt(dialogs, branch, source, attempt) {
   try {
     await attempt(false);
     return { ok: true };
@@ -9535,7 +9929,7 @@ async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
     if (!e.data?.non_ff) return { ok: false, error: e.message };
     const proceed = await dialogs.open({
       title: "Branch has diverged",
-      message: `the local ${branch} has diverged from ${pull_remote || "origin"} (it was likely rebased or force-pushed) \u2014 overwrite the local copy with the remote's?`,
+      message: `the local ${branch} has diverged from ${source} (it was likely rebased or force-pushed) \u2014 overwrite the local copy with the remote's?`,
       okLabel: "Overwrite",
       cancelLabel: "Skip"
     });
@@ -9547,6 +9941,22 @@ async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
       return { ok: false, error: e2.message };
     }
   }
+}
+async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
+  return _fetchWithOverwritePrompt(
+    dialogs,
+    branch,
+    pull_remote || "origin",
+    (force) => postJSON("/api/code/remote-branch/fetch", { path, branch, pull_remote, force })
+  );
+}
+async function fetchPrHead(dialogs, { path, github, number, branch }) {
+  return _fetchWithOverwritePrompt(
+    dialogs,
+    branch,
+    github,
+    (force) => postJSON("/api/code/remote-branch/fetch-pr", { path, github, number, branch, force })
+  );
 }
 function templatePrefill(tpl) {
   if (!tpl) return {};
@@ -10016,10 +10426,11 @@ async function resolvePrBranches(plugins, targets) {
         const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
         const branch = head.branch;
         if (!branch) throw new Error("could not resolve the PR's head branch");
-        const r = await fetchRemoteBranch(dialogs, {
+        const r = await fetchPrHead(dialogs, {
           path: repo.path,
-          branch,
-          pull_remote: repo.push_remote || "dev"
+          github: pull.github,
+          number: pull.number,
+          branch
         });
         if (!r.ok) throw new Error(r.error);
         eventLog.finish(eid, "done");
@@ -10097,13 +10508,22 @@ async function createWorkspaceFromPRs(plugins, targets) {
 var REVIEW_CATEGORY = "review";
 async function createReviewWorkspace(plugins, targets) {
   const { config } = plugins;
+  if (!targets.length) return null;
+  const findExisting = (name2) => (config.config.workspaces || []).find((w) => w.category === REVIEW_CATEGORY && w.name === name2);
+  try {
+    const head = await postJSON("/api/prs/head", {
+      repo: targets[0].pull.github,
+      number: targets[0].pull.number
+    });
+    const existingByHead = head.branch && findExisting(head.branch);
+    if (existingByHead) return existingByHead.id;
+  } catch {
+  }
   const got = await resolvePrBranches(plugins, targets);
-  if (!got) return;
+  if (!got) return null;
   const name = got[0].branch;
-  const existing = (config.config.workspaces || []).some(
-    (w) => w.category === REVIEW_CATEGORY && w.name === name
-  );
-  if (existing) return;
+  const existing = findExisting(name);
+  if (existing) return existing.id;
   if (!(config.config.workspace_categories || []).some((c) => c.id === REVIEW_CATEGORY)) {
     config.updateConfig({
       workspace_categories: [
@@ -10134,6 +10554,23 @@ async function createReviewWorkspace(plugins, targets) {
     category: REVIEW_CATEGORY,
     select: false
   });
+}
+var REVIEW_SAFETY_PREAMBLE = `You are running as an automated code review assistant with full local shell access and no confirmation prompts. Stay read-only with respect to anything outside the local checkout:
+- Never run "git push", or anything that publishes local commits/branches to a remote.
+- Never run "gh pr comment", "gh pr review", "gh pr merge", "gh pr close", "gh pr edit", "gh pr ready", or any other command that mutates a PR/issue/repo on GitHub.
+- Never take any other network-mutating action.
+- Freely read files, run tests/linters, and use local git (diff, log, blame, status) to understand the change.
+Report your findings as a normal reply; do not act on them beyond this conversation.`;
+var REVIEW_SCORE_INSTRUCTION = `Finally, on its own line at the very end of your reply, give your honest guess of this PR's merge readiness as a score out of 100, in exactly this format: "Score: N/100" \u2014 0 meaning there's nothing good about it yet, 100 meaning it's perfect and absolutely ready to merge as-is. This is a rough guess of how much work remains, not a rule-based checklist.`;
+async function runClaudeReview(plugins, ws) {
+  const template = await fetchReviewPrompt();
+  const repos = (ws.checkouts || []).map((c) => c.repo).join(", ");
+  const prompt = `${REVIEW_SAFETY_PREAMBLE}
+
+${template}
+
+${REVIEW_SCORE_INSTRUCTION}`.replaceAll("{{branch}}", ws.name).replaceAll("{{repos}}", repos);
+  return plugins.claude.send(ws, prompt, { review: true });
 }
 async function adoptCurrentCheckout(plugins) {
   const { config, dialogs, code, eventLog, wt, server } = plugins;
@@ -10451,6 +10888,14 @@ var ReviewsScreen = class extends Component {
                 <button class="rev-important" t-att-class="{on: this.isImportant(scope.g.rows)}"
                         t-att-title="this.isImportant(scope.g.rows) ? 'unflag as important' : 'flag as important'"
                         t-on-click.stop="(ev) => this.toggleImportant(scope.g.rows)"><t t-out="this.warningIcon"/></button>
+                <button class="rev-review" t-att-class="this.reviewStateFor(scope.g.key)"
+                        t-att-title="this.reviewTitleFor(scope.g.key)"
+                        t-on-click.stop="(ev) => this.onReviewIconClick(scope.g.rows)">
+                  <t t-out="this.claudeIcon"/>
+                  <span t-if="this.reviewScoreFor(scope.g.key) !== null" class="rev-score"
+                        t-att-class="this.scoreClass(this.reviewScoreFor(scope.g.key))"
+                        t-out="this.reviewScoreFor(scope.g.key)"/>
+                </button>
                 <button class="dash-kebab" title="task actions" t-on-click.stop="(ev) => this.openGroupMenu(ev, scope.g.rows)"><t t-out="this.kebabIcon"/></button>
               </t>
             </RecordList>
@@ -10463,11 +10908,14 @@ var ReviewsScreen = class extends Component {
   db = usePlugin(DatabasePlugin);
   dialogs = usePlugin(DialogPlugin);
   eventLog = usePlugin(EventLogPlugin);
+  router = usePlugin(RouterPlugin);
   wt = usePlugin(WorkspacePlugin);
+  claude = usePlugin(ClaudePlugin);
   reviews = usePlugin(ReviewsPlugin);
   refreshIcon = m(ICONS.refresh);
   kebabIcon = m(ICONS.kebab);
   warningIcon = m(ICONS.warning);
+  claudeIcon = m(ICONS.claude);
   addPrText = signal("");
   addPrNote = signal("");
   statusFilter = signal("");
@@ -10552,6 +11000,12 @@ var ReviewsScreen = class extends Component {
       this.code.loadMergebot(pairs);
       this.reviews.loadReviewStatus(pairs);
     });
+    useEffect(() => {
+      for (const g of this.groupsView()) {
+        const ws = this.reviewWorkspaceFor(g.key);
+        if (ws) this.claude.prime(ws.id);
+      }
+    });
   }
   _statusKey(row) {
     const key = `${row.github}#${row.number}`;
@@ -10601,7 +11055,17 @@ var ReviewsScreen = class extends Component {
     const { branch, siblings } = await this.discoverSiblings(ref);
     if (branch && this.config.config.auto_workspace_on_review) {
       const targets = [ref, ...siblings].map((p) => ({ repo: this._repoFor(p.github), pull: p })).filter((t2) => t2.repo && t2.repo.path);
-      if (targets.length) await createReviewWorkspace(this._dialogPlugins(), targets);
+      if (targets.length) {
+        const plugins = this._dialogPlugins();
+        const wsId = this.reviewWorkspaceFor(branch)?.id || await createReviewWorkspace(plugins, targets);
+        if (wsId && this.config.config.auto_claude_review) {
+          await this.claude.prime(wsId);
+          if (this.reviewStateFor(branch) === "none") {
+            const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+            if (ws) await runClaudeReview(plugins, ws);
+          }
+        }
+      }
     }
   }
   // once a PR is tracked, look for a sibling PR on the same branch in every
@@ -10643,13 +11107,61 @@ var ReviewsScreen = class extends Component {
       db: this.db,
       code: this.code,
       eventLog: this.eventLog,
-      wt: this.wt
+      wt: this.wt,
+      claude: this.claude
     };
   }
   // a row's repo — resolved from its github slug against configured repos (a
   // tracked PR whose repo isn't configured locally has no checkout to branch)
   _repoFor(github) {
     return (this.config.config.repos || []).find((r) => r.github === github) || null;
+  }
+  // {repo, pull} targets for a set of rows, dropping any whose repo isn't
+  // configured locally — shared by createTaskWorkspace and reviewGroup.
+  _targetsFor(rows) {
+    return rows.map((row) => ({
+      repo: this._repoFor(row.github),
+      pull: { github: row.github, number: row.number }
+    })).filter((t2) => t2.repo && t2.repo.path);
+  }
+  // the review workspace already tracking this task's branch, if any — a plain
+  // synchronous lookup (no priming/network) so the group-header button can color
+  // itself "ready" without an N-groups history fetch on every render.
+  reviewWorkspaceFor(branch) {
+    return (this.config.config.workspaces || []).find(
+      (w) => w.category === REVIEW_CATEGORY && w.name === branch
+    ) || null;
+  }
+  // "none" (nothing started yet — clicking starts one) | "running" (Claude is
+  // actively working) | "done" (a review is available to read). Reflects
+  // ClaudePlugin's live reactive state, which is only accurate once the
+  // conversation has been primed at least once (setup()'s priming effect does
+  // this for every visible task) — after that it stays current via the global
+  // SSE "claude" listener (ClaudePlugin.apply), with no polling needed here.
+  reviewStateFor(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    if (!ws) return "none";
+    if (this.claude.running(ws.id)) return "running";
+    return this.claude.items(ws.id).length ? "done" : "none";
+  }
+  reviewTitleFor(branch) {
+    const state = this.reviewStateFor(branch);
+    if (state === "running") return "Claude is reviewing this task\u2026";
+    if (state === "done") {
+      const score = this.reviewScoreFor(branch);
+      return score === null ? "Claude review available \u2014 click to read it" : `Claude review available \u2014 merge-readiness guess: ${score}/100 \u2014 click to read it`;
+    }
+    return "Run a Claude review for this task";
+  }
+  // Claude's own merge-readiness guess (0-100) for a finished review, or null if
+  // none was reported (see ClaudePlugin.reviewScore) — the little colored badge
+  // next to the review icon once a review is "done".
+  reviewScoreFor(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    return ws ? this.claude.reviewScore(ws.id) : null;
+  }
+  scoreClass(score) {
+    return reviewScoreClass(score);
   }
   async createRowWorkspace(row) {
     const repo = this._repoFor(row.github);
@@ -10667,12 +11179,64 @@ var ReviewsScreen = class extends Component {
     ]);
   }
   async createTaskWorkspace(rows) {
-    const targets = rows.map((row) => ({
-      repo: this._repoFor(row.github),
-      pull: { github: row.github, number: row.number }
-    })).filter((t2) => t2.repo && t2.repo.path);
+    const targets = this._targetsFor(rows);
     if (!targets.length) return;
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
+  }
+  // Ensure a review workspace exists for this task (idempotent) and start its
+  // Claude review ONLY if one hasn't already started ("none" state — never
+  // while "running" or "done", so re-clicking never re-asks Claude to review
+  // again). Returns the workspace id (or null on failure — an error is already
+  // surfaced by resolvePrBranches/createWorktree). Shared by the group-header
+  // icon (onReviewIconClick, stays on this screen) and reviewGroup (the task
+  // menu's "Review" action, which navigates afterward).
+  async _startReview(rows) {
+    const branch = rows[0]?.branch;
+    const plugins = this._dialogPlugins();
+    let wsId = this.reviewWorkspaceFor(branch)?.id;
+    if (!wsId) {
+      const targets = this._targetsFor(rows);
+      if (!targets.length) return null;
+      wsId = await createReviewWorkspace(plugins, targets);
+    }
+    if (!wsId) return null;
+    await this.claude.prime(wsId);
+    if (this.reviewStateFor(branch) === "none") {
+      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+      if (ws) await runClaudeReview(plugins, ws);
+    }
+    return wsId;
+  }
+  // the task menu's "Review" action: same as the group-header icon, but always
+  // lands on the workspace's own Claude tab afterward — "running" shows the
+  // live in-progress conversation, "done" shows the finished answer.
+  async reviewGroup(rows) {
+    const wsId = await this._startReview(rows);
+    if (!wsId) return;
+    this.wt.selectOnOpen(wsId);
+    this.wt.requestedPane.set("claude");
+    this.router.go("workspaces");
+  }
+  // the group-header icon's click: "none" starts a review right here, without
+  // navigating away (this screen is the vantage point — the icon itself starts
+  // spinning via reviewStateFor/CSS while it runs); "running" is a no-op, the
+  // spinning icon already says what's happening; "done" opens the saved review
+  // in a side panel (openReviewPanel) instead of jumping to the Claude tab —
+  // that panel's own "Continue to chat with claude" button is the escape hatch
+  // for anyone who wants the full transcript.
+  async onReviewIconClick(rows) {
+    const state = this.reviewStateFor(rows[0]?.branch);
+    if (state === "running") return;
+    if (state === "done") return this.openReviewPanel(rows[0].branch);
+    await this._startReview(rows);
+  }
+  // open the task's saved review markdown in a floating side panel, straight from
+  // disk (ClaudePlugin.fetchReviewText) — a quick read that doesn't navigate away
+  // from this screen the way reviewGroup's "open the Claude tab" does.
+  openReviewPanel(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    if (!ws) return;
+    this.dialogs.openComponent(ReviewPanel, { workspaceId: ws.id, label: `Review \xB7 ${branch}` });
   }
   // how many tasks are fully merged (base PR(s) + every forward port) — drives
   // the top bar's "Untrack all merged" button, both its visibility and count.
@@ -10736,7 +11300,10 @@ var ReviewsScreen = class extends Component {
   // the row's own kebab covers that case); Untrack drops every PR in the task.
   openGroupMenu(ev, rows) {
     const rect = ev.currentTarget.getBoundingClientRect();
-    const actions = [{ label: "Create workspace", onClick: () => this.createTaskWorkspace(rows) }];
+    const actions = [
+      { label: "Create workspace", onClick: () => this.createTaskWorkspace(rows) },
+      { label: "Review", onClick: () => this.reviewGroup(rows) }
+    ];
     if (rows.length === 1) {
       const row = rows[0];
       actions.push({ label: "Open on GitHub", onClick: () => window.open(row.url, "_blank") });
@@ -11568,138 +12135,6 @@ var TodoScreen = class extends Component {
       STORAGE_KEY3,
       JSON.stringify({ lists: this.lists(), selected: this.selected() })
     );
-  }
-};
-
-// static/src/workspaces_screen/claude_plugin.js
-var CLAUDE_MODELS = [
-  { value: "", label: "Default model" },
-  { value: "opus[1m]", label: "Opus 4.8 \xB7 1M" },
-  { value: "opus", label: "Opus 4.8" },
-  { value: "sonnet", label: "Sonnet 5" },
-  { value: "haiku", label: "Haiku 4.5" }
-];
-var ClaudePlugin = class extends Plugin {
-  static sequence = 6;
-  // after WorkspacePlugin (5), whose wtRepos() it reuses
-  config = usePlugin(ConfigPlugin);
-  server = usePlugin(ServerPlugin);
-  worktree = usePlugin(WorkspacePlugin);
-  eventLog = usePlugin(EventLogPlugin);
-  dialogs = usePlugin(DialogPlugin);
-  convos = signal({});
-  // targetId -> { items: [...], state: "idle"|"running" }
-  models = CLAUDE_MODELS;
-  model = signal(this.config.getState("claude_model", ""));
-  // chosen model, persisted
-  _primed = /* @__PURE__ */ new Set();
-  // targets whose transcript we've fetched from the backend
-  setup() {
-    this.server.onClaude((d) => this.apply(d));
-  }
-  setModel(v) {
-    this.model.set(v || "");
-    this.config.setState("claude_model", v || "");
-  }
-  _get(id) {
-    return this.convos()[id] || { items: [], state: "idle" };
-  }
-  _set(id, next) {
-    this.convos.set({ ...this.convos(), [id]: next });
-  }
-  _append(id, item) {
-    const c = this._get(id);
-    this._set(id, { ...c, items: [...c.items, item] });
-  }
-  items(id) {
-    return this._get(id).items;
-  }
-  running(id) {
-    return this._get(id).state === "running";
-  }
-  // a live chat item pushed from the backend (assistant text, tool activity, result,
-  // or error). The final "result" ends the turn — flip back to idle.
-  apply(d) {
-    if (!d || !d.workspace) return;
-    const id = d.workspace;
-    if (d.role === "result") {
-      const c = this._get(id);
-      if (!d.ok && d.error) this._set(id, { ...c, items: [...c.items, d], state: "idle" });
-      else this._set(id, { ...c, state: "idle" });
-      return;
-    }
-    this._append(id, d);
-  }
-  // fetch the transcript once per target (after a reload the backend still holds it);
-  // skip if we already have live items so an in-flight turn isn't clobbered
-  async prime(id) {
-    if (!id || this._primed.has(id)) return;
-    this._primed.add(id);
-    if (this._get(id).items.length) return;
-    try {
-      const res = await postJSON("/api/workspace/claude/history", { workspace: id });
-      this._set(id, { items: res.items || [], state: res.state || "idle" });
-    } catch {
-    }
-  }
-  // where Claude works for <tgt>: a worktree workspace's own checkout copies, or —
-  // for a main-located workspace (the screen only offers it when loaded) — the REAL
-  // main checkout paths. Returns { cwd, addDirs } or null (error already shown).
-  // Note: removing a main-located workspace never CLAUDE.forgets its transcript
-  // (only /api/workspace/remove does) — a harmless stale in-memory convo.
-  _dirsFor(tgt) {
-    const mainRepoId = this.config.config.main_repo_id || "community";
-    if (this.worktree.isWorktree(tgt)) {
-      const repos = this.worktree.wtRepos(tgt);
-      const main = repos.find((r) => r.repo === mainRepoId);
-      if (!main) {
-        this.dialogs.error("Cannot run Claude", "this worktree has no main repo checkout");
-        return null;
-      }
-      return {
-        cwd: main.worktreePath,
-        addDirs: repos.filter((r) => r.repo !== mainRepoId).map((r) => r.worktreePath)
-      };
-    }
-    const pathById = Object.fromEntries(this.config.config.repos.map((r) => [r.id, r.path]));
-    const cwd = pathById[mainRepoId];
-    if (!cwd) {
-      this.dialogs.error("Cannot run Claude", "no main repo configured");
-      return null;
-    }
-    const addDirs = (tgt.checkouts || []).filter((c) => c.repo !== mainRepoId).map((c) => pathById[c.repo]).filter(Boolean);
-    return { cwd, addDirs };
-  }
-  // send a task to Claude for <tgt>, running in its checkout (worktree copies, or
-  // the main checkout for a loaded main-located workspace) with the workspace's
-  // other repos added as extra allowed dirs
-  async send(tgt, prompt) {
-    const text = (prompt || "").trim();
-    if (!text || this.running(tgt.id)) return;
-    const dirs = this._dirsFor(tgt);
-    if (!dirs) return;
-    this.config.workspace(tgt.id)?.touchActivity();
-    this._append(tgt.id, { role: "user", text });
-    this._set(tgt.id, { ...this._get(tgt.id), state: "running" });
-    try {
-      await postJSON("/api/workspace/claude", {
-        workspace: tgt.id,
-        prompt: text,
-        cwd: dirs.cwd,
-        addDirs: dirs.addDirs,
-        model: this.model() || void 0
-      });
-    } catch (e) {
-      this._append(tgt.id, { role: "error", text: e.message });
-      this._set(tgt.id, { ...this._get(tgt.id), state: "idle" });
-    }
-  }
-  async stop(tgt) {
-    try {
-      await postJSON("/api/workspace/claude/stop", { workspace: tgt.id });
-    } catch {
-    }
-    this._set(tgt.id, { ...this._get(tgt.id), state: "idle" });
   }
 };
 

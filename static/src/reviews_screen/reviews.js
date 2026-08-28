@@ -11,13 +11,21 @@ import { ConfigPlugin } from "../core/config_plugin.js";
 import { DatabasePlugin } from "../core/database_plugin.js";
 import { DialogPlugin } from "../core/dialog_plugin.js";
 import { EventLogPlugin } from "../core/event_log_plugin.js";
+import { RouterPlugin } from "../core/router_plugin.js";
 import { WorkspacePlugin } from "../core/workspace_plugin.js";
+import { ClaudePlugin } from "../workspaces_screen/claude_plugin.js";
 import { ReviewsPlugin } from "./reviews_plugin.js";
+import { ReviewPanel } from "./review_panel.js";
 import { appBus, ICONS, m } from "../core/common.js";
-import { timeAgo } from "../core/utils.js";
+import { timeAgo, reviewScoreClass } from "../core/utils.js";
 import { Panel } from "../core/panel.js";
 import { RecordList, recordset } from "../core/recordset.js";
-import { createReviewWorkspace, createWorkspaceFromPRs } from "../workspaces_screen/dialogs.js";
+import {
+  createReviewWorkspace,
+  createWorkspaceFromPRs,
+  runClaudeReview,
+  REVIEW_CATEGORY,
+} from "../workspaces_screen/dialogs.js";
 import { ActionsCell } from "../branches_screen/cells.js";
 import {
   ForwardPortsCell,
@@ -85,6 +93,14 @@ export class ReviewsScreen extends Component {
                 <button class="rev-important" t-att-class="{on: this.isImportant(scope.g.rows)}"
                         t-att-title="this.isImportant(scope.g.rows) ? 'unflag as important' : 'flag as important'"
                         t-on-click.stop="(ev) => this.toggleImportant(scope.g.rows)"><t t-out="this.warningIcon"/></button>
+                <button class="rev-review" t-att-class="this.reviewStateFor(scope.g.key)"
+                        t-att-title="this.reviewTitleFor(scope.g.key)"
+                        t-on-click.stop="(ev) => this.onReviewIconClick(scope.g.rows)">
+                  <t t-out="this.claudeIcon"/>
+                  <span t-if="this.reviewScoreFor(scope.g.key) !== null" class="rev-score"
+                        t-att-class="this.scoreClass(this.reviewScoreFor(scope.g.key))"
+                        t-out="this.reviewScoreFor(scope.g.key)"/>
+                </button>
                 <button class="dash-kebab" title="task actions" t-on-click.stop="(ev) => this.openGroupMenu(ev, scope.g.rows)"><t t-out="this.kebabIcon"/></button>
               </t>
             </RecordList>
@@ -98,11 +114,14 @@ export class ReviewsScreen extends Component {
   db = usePlugin(DatabasePlugin);
   dialogs = usePlugin(DialogPlugin);
   eventLog = usePlugin(EventLogPlugin);
+  router = usePlugin(RouterPlugin);
   wt = usePlugin(WorkspacePlugin);
+  claude = usePlugin(ClaudePlugin);
   reviews = usePlugin(ReviewsPlugin);
   refreshIcon = m(ICONS.refresh);
   kebabIcon = m(ICONS.kebab);
   warningIcon = m(ICONS.warning);
+  claudeIcon = m(ICONS.claude);
   addPrText = signal("");
   addPrNote = signal("");
   statusFilter = signal(""); // "" = all
@@ -196,6 +215,17 @@ export class ReviewsScreen extends Component {
       this.code.loadMergebot(pairs);
       this.reviews.loadReviewStatus(pairs);
     });
+    // seed each visible task's review status from the backend once (ClaudePlugin.prime
+    // is itself a one-shot fetch, guarded internally) — after that, live SSE "claude"
+    // events keep it current reactively (ClaudePlugin.apply is wired globally, not
+    // just while the Workspaces screen is mounted), so the group-header icon reflects
+    // "running"/"done" without any polling here.
+    useEffect(() => {
+      for (const g of this.groupsView()) {
+        const ws = this.reviewWorkspaceFor(g.key);
+        if (ws) this.claude.prime(ws.id);
+      }
+    });
   }
 
   _statusKey(row) {
@@ -255,7 +285,18 @@ export class ReviewsScreen extends Component {
       const targets = [ref, ...siblings]
         .map((p) => ({ repo: this._repoFor(p.github), pull: p }))
         .filter((t) => t.repo && t.repo.path);
-      if (targets.length) await createReviewWorkspace(this._dialogPlugins(), targets);
+      if (targets.length) {
+        const plugins = this._dialogPlugins();
+        const wsId =
+          this.reviewWorkspaceFor(branch)?.id || (await createReviewWorkspace(plugins, targets));
+        if (wsId && this.config.config.auto_claude_review) {
+          await this.claude.prime(wsId);
+          if (this.reviewStateFor(branch) === "none") {
+            const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+            if (ws) await runClaudeReview(plugins, ws);
+          }
+        }
+      }
     }
   }
 
@@ -301,6 +342,7 @@ export class ReviewsScreen extends Component {
       code: this.code,
       eventLog: this.eventLog,
       wt: this.wt,
+      claude: this.claude,
     };
   }
 
@@ -308,6 +350,65 @@ export class ReviewsScreen extends Component {
   // tracked PR whose repo isn't configured locally has no checkout to branch)
   _repoFor(github) {
     return (this.config.config.repos || []).find((r) => r.github === github) || null;
+  }
+
+  // {repo, pull} targets for a set of rows, dropping any whose repo isn't
+  // configured locally — shared by createTaskWorkspace and reviewGroup.
+  _targetsFor(rows) {
+    return rows
+      .map((row) => ({
+        repo: this._repoFor(row.github),
+        pull: { github: row.github, number: row.number },
+      }))
+      .filter((t) => t.repo && t.repo.path);
+  }
+
+  // the review workspace already tracking this task's branch, if any — a plain
+  // synchronous lookup (no priming/network) so the group-header button can color
+  // itself "ready" without an N-groups history fetch on every render.
+  reviewWorkspaceFor(branch) {
+    return (
+      (this.config.config.workspaces || []).find(
+        (w) => w.category === REVIEW_CATEGORY && w.name === branch,
+      ) || null
+    );
+  }
+
+  // "none" (nothing started yet — clicking starts one) | "running" (Claude is
+  // actively working) | "done" (a review is available to read). Reflects
+  // ClaudePlugin's live reactive state, which is only accurate once the
+  // conversation has been primed at least once (setup()'s priming effect does
+  // this for every visible task) — after that it stays current via the global
+  // SSE "claude" listener (ClaudePlugin.apply), with no polling needed here.
+  reviewStateFor(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    if (!ws) return "none";
+    if (this.claude.running(ws.id)) return "running";
+    return this.claude.items(ws.id).length ? "done" : "none";
+  }
+
+  reviewTitleFor(branch) {
+    const state = this.reviewStateFor(branch);
+    if (state === "running") return "Claude is reviewing this task…";
+    if (state === "done") {
+      const score = this.reviewScoreFor(branch);
+      return score === null
+        ? "Claude review available — click to read it"
+        : `Claude review available — merge-readiness guess: ${score}/100 — click to read it`;
+    }
+    return "Run a Claude review for this task";
+  }
+
+  // Claude's own merge-readiness guess (0-100) for a finished review, or null if
+  // none was reported (see ClaudePlugin.reviewScore) — the little colored badge
+  // next to the review icon once a review is "done".
+  reviewScoreFor(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    return ws ? this.claude.reviewScore(ws.id) : null;
+  }
+
+  scoreClass(score) {
+    return reviewScoreClass(score);
   }
 
   async createRowWorkspace(row) {
@@ -327,14 +428,71 @@ export class ReviewsScreen extends Component {
   }
 
   async createTaskWorkspace(rows) {
-    const targets = rows
-      .map((row) => ({
-        repo: this._repoFor(row.github),
-        pull: { github: row.github, number: row.number },
-      }))
-      .filter((t) => t.repo && t.repo.path);
+    const targets = this._targetsFor(rows);
     if (!targets.length) return;
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
+  }
+
+  // Ensure a review workspace exists for this task (idempotent) and start its
+  // Claude review ONLY if one hasn't already started ("none" state — never
+  // while "running" or "done", so re-clicking never re-asks Claude to review
+  // again). Returns the workspace id (or null on failure — an error is already
+  // surfaced by resolvePrBranches/createWorktree). Shared by the group-header
+  // icon (onReviewIconClick, stays on this screen) and reviewGroup (the task
+  // menu's "Review" action, which navigates afterward).
+  async _startReview(rows) {
+    const branch = rows[0]?.branch;
+    const plugins = this._dialogPlugins();
+    // fast path: the group's rows already carry their resolved branch name (no
+    // fetch needed) — reuse an existing review workspace straight away rather
+    // than going through createReviewWorkspace's own (network) pre-check.
+    let wsId = this.reviewWorkspaceFor(branch)?.id;
+    if (!wsId) {
+      const targets = this._targetsFor(rows);
+      if (!targets.length) return null;
+      wsId = await createReviewWorkspace(plugins, targets);
+    }
+    if (!wsId) return null;
+    await this.claude.prime(wsId);
+    if (this.reviewStateFor(branch) === "none") {
+      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+      if (ws) await runClaudeReview(plugins, ws);
+    }
+    return wsId;
+  }
+
+  // the task menu's "Review" action: same as the group-header icon, but always
+  // lands on the workspace's own Claude tab afterward — "running" shows the
+  // live in-progress conversation, "done" shows the finished answer.
+  async reviewGroup(rows) {
+    const wsId = await this._startReview(rows);
+    if (!wsId) return;
+    this.wt.selectOnOpen(wsId);
+    this.wt.requestedPane.set("claude");
+    this.router.go("workspaces");
+  }
+
+  // the group-header icon's click: "none" starts a review right here, without
+  // navigating away (this screen is the vantage point — the icon itself starts
+  // spinning via reviewStateFor/CSS while it runs); "running" is a no-op, the
+  // spinning icon already says what's happening; "done" opens the saved review
+  // in a side panel (openReviewPanel) instead of jumping to the Claude tab —
+  // that panel's own "Continue to chat with claude" button is the escape hatch
+  // for anyone who wants the full transcript.
+  async onReviewIconClick(rows) {
+    const state = this.reviewStateFor(rows[0]?.branch);
+    if (state === "running") return;
+    if (state === "done") return this.openReviewPanel(rows[0].branch);
+    await this._startReview(rows);
+  }
+
+  // open the task's saved review markdown in a floating side panel, straight from
+  // disk (ClaudePlugin.fetchReviewText) — a quick read that doesn't navigate away
+  // from this screen the way reviewGroup's "open the Claude tab" does.
+  openReviewPanel(branch) {
+    const ws = this.reviewWorkspaceFor(branch);
+    if (!ws) return;
+    this.dialogs.openComponent(ReviewPanel, { workspaceId: ws.id, label: `Review · ${branch}` });
   }
 
   // how many tasks are fully merged (base PR(s) + every forward port) — drives
@@ -406,7 +564,10 @@ export class ReviewsScreen extends Component {
   // the row's own kebab covers that case); Untrack drops every PR in the task.
   openGroupMenu(ev, rows) {
     const rect = ev.currentTarget.getBoundingClientRect();
-    const actions = [{ label: "Create workspace", onClick: () => this.createTaskWorkspace(rows) }];
+    const actions = [
+      { label: "Create workspace", onClick: () => this.createTaskWorkspace(rows) },
+      { label: "Review", onClick: () => this.reviewGroup(rows) },
+    ];
     if (rows.length === 1) {
       const row = rows[0];
       actions.push({ label: "Open on GitHub", onClick: () => window.open(row.url, "_blank") });

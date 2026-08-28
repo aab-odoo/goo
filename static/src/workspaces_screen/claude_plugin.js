@@ -11,7 +11,7 @@ import { ServerPlugin } from "../core/server_plugin.js";
 import { WorkspacePlugin } from "../core/workspace_plugin.js";
 import { EventLogPlugin } from "../core/event_log_plugin.js";
 import { DialogPlugin } from "../core/dialog_plugin.js";
-import { postJSON } from "../core/utils.js";
+import { postJSON, parseReviewScore } from "../core/utils.js";
 
 import { Plugin, usePlugin, signal } from "@odoo/owl";
 
@@ -69,6 +69,24 @@ export class ClaudePlugin extends Plugin {
     return this._get(id).state === "running";
   }
 
+  // the merge-readiness score (0-100) Claude reported at the end of a review
+  // turn, if any — parsed from the conversation's own assistant text. A review
+  // run always ends its prompt with a fixed, non-editable instruction to report
+  // one as "Score: N/100" (see REVIEW_SCORE_INSTRUCTION, workspaces_screen/
+  // dialogs.js), so this needs no dedicated backend field. Returns the LAST one
+  // found across the conversation (a later re-review after changes wins), or
+  // null if none was ever reported (an older review, a non-review chat, or
+  // Claude just didn't comply).
+  reviewScore(id) {
+    let score = null;
+    for (const item of this.items(id)) {
+      if (item.role !== "assistant" || !item.text) continue;
+      const s = parseReviewScore(item.text);
+      if (s !== null) score = s;
+    }
+    return score;
+  }
+
   // a live chat item pushed from the backend (assistant text, tool activity, result,
   // or error). The final "result" ends the turn — flip back to idle.
   apply(d) {
@@ -94,6 +112,20 @@ export class ClaudePlugin extends Plugin {
       this._set(id, { items: res.items || [], state: res.state || "idle" });
     } catch {
       /* leave empty */
+    }
+  }
+
+  // the raw persisted review markdown for <id> (backend's ClaudeManager.review_text),
+  // straight from disk regardless of in-memory conversation state — used by the
+  // Reviews screen's "open review" panel. Always re-fetched (no once-guard like
+  // prime()), since this is opened on demand rather than primed for every visible
+  // task.
+  async fetchReviewText(id) {
+    try {
+      const res = await postJSON("/api/workspace/claude/review", { workspace: id });
+      return res.text || "";
+    } catch {
+      return "";
     }
   }
 
@@ -134,8 +166,11 @@ export class ClaudePlugin extends Plugin {
 
   // send a task to Claude for <tgt>, running in its checkout (worktree copies, or
   // the main checkout for a loaded main-located workspace) with the workspace's
-  // other repos added as extra allowed dirs
-  async send(tgt, prompt) {
+  // other repos added as extra allowed dirs. `review: true` (a review run — see
+  // dialogs.js's runClaudeReview) tells the backend to save this turn's reply to
+  // disk on completion, so it survives a goo restart (an ordinary chat turn stays
+  // in-memory only, as before).
+  async send(tgt, prompt, { review = false } = {}) {
     const text = (prompt || "").trim();
     if (!text || this.running(tgt.id)) return;
     const dirs = this._dirsFor(tgt);
@@ -150,6 +185,7 @@ export class ClaudePlugin extends Plugin {
         cwd: dirs.cwd,
         addDirs: dirs.addDirs,
         model: this.model() || undefined,
+        review,
       });
     } catch (e) {
       this._append(tgt.id, { role: "error", text: e.message });

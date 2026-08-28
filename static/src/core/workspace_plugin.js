@@ -407,7 +407,7 @@ export class WorkspacePlugin extends Plugin {
       this._merge(id, { exists: true, state: "stopped", port: null });
       this.eventLog.finish(eid, "done");
       if (select) this.select(id);
-      return true;
+      return id;
     } catch (e) {
       this.eventLog.finish(eid, "error");
       return this._error("Workspace creation failed", e.message);
