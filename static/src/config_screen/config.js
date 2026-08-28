@@ -682,6 +682,10 @@ export class ConfigScreen extends Component {
             <input id="setting-cleanup-enabled" type="checkbox" class="settings-check" title="Once a day, automatically delete a worktree workspace once every checkout with a PR shows it merged (skipped if anything is dirty or unpushed). Branches are only ever deleted locally, never on the remote."
                    t-att-checked="this.config.config.cleanup_enabled"
                    t-on-change="ev => this.config.updateConfig({ cleanup_enabled: ev.target.checked })"/>
+            <label for="setting-auto-workspace-on-review" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation.">auto-create workspace on review</label>
+            <input id="setting-auto-workspace-on-review" type="checkbox" class="settings-check" title="When a PR is added in the Reviews screen — including any sibling PR auto-discovered on the same branch in another repo — automatically create a worktree workspace for it, in its own &quot;review&quot; category. Not activated on creation."
+                   t-att-checked="this.config.config.auto_workspace_on_review"
+                   t-on-change="ev => this.config.updateConfig({ auto_workspace_on_review: ev.target.checked })"/>
           </div>
         </div>
         <TabsEditor/>

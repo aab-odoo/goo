@@ -310,6 +310,7 @@ export class WorkspacePlugin extends Plugin {
     parent = "",
     createVenv = false,
     forkRepos = new Set(),
+    select = true,
   }) {
     if (!checkouts || !checkouts.length)
       return this._error("Create workspace", "the workspace has no checkouts");
@@ -405,7 +406,7 @@ export class WorkspacePlugin extends Plugin {
       this.config.updateConfig({ workspaces: [...this.config.config.workspaces, ws] });
       this._merge(id, { exists: true, state: "stopped", port: null });
       this.eventLog.finish(eid, "done");
-      this.select(id);
+      if (select) this.select(id);
       return true;
     } catch (e) {
       this.eventLog.finish(eid, "error");

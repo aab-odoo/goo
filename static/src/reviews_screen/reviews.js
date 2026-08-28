@@ -17,7 +17,7 @@ import { appBus, ICONS, m } from "../core/common.js";
 import { timeAgo } from "../core/utils.js";
 import { Panel } from "../core/panel.js";
 import { RecordList, recordset } from "../core/recordset.js";
-import { createWorkspaceFromPRs } from "../workspaces_screen/dialogs.js";
+import { createReviewWorkspace, createWorkspaceFromPRs } from "../workspaces_screen/dialogs.js";
 import { ActionsCell } from "../branches_screen/cells.js";
 import {
   ForwardPortsCell,
@@ -250,19 +250,27 @@ export class ReviewsScreen extends Component {
       return;
     }
     this.addPrNote.set("");
-    await this.discoverSiblings(ref);
+    const { branch, siblings } = await this.discoverSiblings(ref);
+    if (branch && this.config.config.auto_workspace_on_review) {
+      const targets = [ref, ...siblings]
+        .map((p) => ({ repo: this._repoFor(p.github), pull: p }))
+        .filter((t) => t.repo && t.repo.path);
+      if (targets.length) await createReviewWorkspace(this._dialogPlugins(), targets);
+    }
   }
 
   // once a PR is tracked, look for a sibling PR on the same branch in every
   // OTHER configured repo (the cross-repo task convention) and track those too
   // — so adding one PR of a multi-repo task picks up the rest automatically.
+  // Returns the resolved branch (null if it couldn't be resolved at all) and
+  // the newly-tracked siblings, so addPr can also drive auto-workspace-creation.
   async discoverSiblings(ref) {
     const info = await this.reviews.fetchOne(ref);
-    if (!info?.branch) return;
+    if (!info?.branch) return { branch: null, siblings: [] };
     const otherRepos = (this.config.config.repos || []).filter(
       (r) => r.github && r.github !== ref.github,
     );
-    if (!otherRepos.length) return;
+    if (!otherRepos.length) return { branch: info.branch, siblings: [] };
     const siblings = await this.reviews.findSiblings(
       otherRepos.map((r) => ({ github: r.github, branch: info.branch })),
     );
@@ -271,6 +279,7 @@ export class ReviewsScreen extends Component {
       this.addPrNote.set(
         `+${added.length} related PR${added.length === 1 ? "" : "s"} found on "${info.branch}"`,
       );
+    return { branch: info.branch, siblings: added };
   }
 
   async refresh() {
@@ -319,7 +328,10 @@ export class ReviewsScreen extends Component {
 
   async createTaskWorkspace(rows) {
     const targets = rows
-      .map((row) => ({ repo: this._repoFor(row.github), pull: { github: row.github, number: row.number } }))
+      .map((row) => ({
+        repo: this._repoFor(row.github),
+        pull: { github: row.github, number: row.number },
+      }))
       .filter((t) => t.repo && t.repo.path);
     if (!targets.length) return;
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
@@ -353,6 +365,7 @@ export class ReviewsScreen extends Component {
       this.config,
       rows.map((r) => r.id),
     );
+    await this._removeWorkspaceIfOrphaned(rows[0]?.branch);
   }
 
   // bulk-drop every task that's fully merged (base PR(s) + every forward port)
@@ -371,6 +384,21 @@ export class ReviewsScreen extends Component {
       this.config,
       groups.flatMap((g) => g.rows.map((r) => r.id)),
     );
+    await Promise.all(groups.map((g) => this._removeWorkspaceIfOrphaned(g.rows[0]?.branch)));
+  }
+
+  // drop the task's auto-created review workspace (createReviewWorkspace) once
+  // nothing tracked still shares its branch — untracking every PR in a task
+  // shouldn't leave its worktree/checkout behind forever. Skipped (does
+  // nothing) when another row on the same branch is still tracked (a
+  // multi-repo task untracked one row at a time via untrackRow) or when the
+  // workspace is busy (removeSilently itself no-ops then) — the untrack action
+  // was already confirmed, so this stays silent, same as cascade child removal.
+  async _removeWorkspaceIfOrphaned(branch) {
+    if (!branch) return;
+    if (this.allRows().some((r) => r.branch === branch)) return;
+    const ws = this.reviewWorkspaceFor(branch);
+    if (ws) await this.wt.removeSilently(ws);
   }
 
   // a task's (group header's) menu: Create workspace always; Open on GitHub /
@@ -454,5 +482,6 @@ export class ReviewsScreen extends Component {
   async untrackRow(row) {
     if (!(await this._confirmUntrack([row]))) return;
     this.reviews.untrack(this.config, row.id);
+    await this._removeWorkspaceIfOrphaned(row.branch);
   }
 }
