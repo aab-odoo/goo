@@ -72,6 +72,11 @@ export const DEFAULT_CONFIG = {
   // worktree workspace for it (and any sibling PR auto-discovered on the same
   // branch), in its own "review" category, without activating it.
   auto_workspace_on_review: false,
+  // off by default, nested under auto_workspace_on_review: also auto-run a
+  // Claude review in the freshly-created review workspace, using the
+  // review_prompt.md template (edited in the Configuration screen). The manual
+  // "Review" action in the Reviews screen works regardless of this setting.
+  auto_claude_review: false,
   // the create-workspace dialog's Location field default: "main" (one loaded
   // at a time) or "worktree" (its own checkout, runs concurrently). Only the
   // dialog's own initial value — never overwrites what the user picks there.

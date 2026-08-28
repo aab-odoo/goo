@@ -3315,6 +3315,23 @@ the leak is real.
         non_ff = bool(error) and r is not None and "non-fast-forward" in (r.stderr or "")
         return error is None, error, non_ff
 
+    def fetch_pr_head(self, path, github, number, branch, force=False):
+        """Fetch a PR's head commit via GitHub's refs/pull/<number>/head, straight
+        from the PR's own repo (https://github.com/<github>.git) rather than any
+        locally-configured remote — refs/pull/<number>/head only ever resolves
+        against the exact repo the PR was opened on, which a repo's configured
+        pull_remote/push_remote (a differently-named alias, the user's own fork,
+        or a shared internal staging remote used for colleagues'/fw-bot's WIP
+        branches) has no guarantee of actually being. Relies on git's normal
+        credential resolution for github.com (e.g. `gh auth login`'s HTTPS
+        credential helper), same as any other github.com fetch. Onto the local
+        branch <branch>. Returns (ok, error, non_ff)."""
+        url = f"https://github.com/{github}.git"
+        refspec = f"{'+' if force else ''}refs/pull/{number}/head:{branch}"
+        r, error = self._git(path, "fetch", url, refspec, timeout=60, err="git fetch failed")
+        non_ff = bool(error) and r is not None and "non-fast-forward" in (r.stderr or "")
+        return error is None, error, non_ff
+
     def fetch_rebase(self, path, base, pull_remote="origin", repo=""):
         """Fetch the base branch from the configured pull remote and rebase the
         current branch onto it. Announces the fetch and rebase phases via notify.

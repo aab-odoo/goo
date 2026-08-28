@@ -12,7 +12,12 @@ import {
 } from "../core/config.js";
 import { newWorkspaceId } from "../core/config_plugin.js";
 import { RemoteBranchDialog } from "../core/dialogs.js";
-import { postJSON, repoBranchList, descendantWorkspaces } from "../core/utils.js";
+import {
+  postJSON,
+  repoBranchList,
+  descendantWorkspaces,
+  fetchReviewPrompt,
+} from "../core/utils.js";
 import { cascadeRemoveDescendants } from "../core/workspace_plugin.js";
 
 import { Component, onMounted, onWillUnmount, signal, t, useProps, xml } from "@odoo/owl";
@@ -46,16 +51,13 @@ const configFromRepos = (repoIds, branch, currentConfig = "", preserveExisting =
   return repoBranchList.format(repoIds.map((repo) => ({ repo, branch: existing[repo] ?? branch })));
 };
 
-// Fetch a remote branch into a local one of the same name — the shared step
-// every "attach existing branch" source (bundle, remote-branch search,
-// forward-port) starts from. A plain non-fast-forward rejection means the
-// local branch already exists here and has diverged from the remote (it was
-// rebased/force-pushed since goo last fetched it) — ask before overwriting the
-// local copy rather than just failing the whole flow outright. Returns
-// {ok, error?}.
-async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
-  const attempt = (force) =>
-    postJSON("/api/code/remote-branch/fetch", { path, branch, pull_remote, force });
+// Shared "try, then on a non-fast-forward rejection offer to overwrite" dance —
+// the local branch already exists here and has diverged from the remote (it was
+// rebased/force-pushed since goo last fetched it); ask before overwriting the
+// local copy rather than just failing the whole flow outright. `source` is only
+// used in the confirmation message (a remote name, or a "owner/repo" slug).
+// `attempt(force)` does the actual fetch. Returns {ok, error?}.
+async function _fetchWithOverwritePrompt(dialogs, branch, source, attempt) {
   try {
     await attempt(false);
     return { ok: true };
@@ -63,7 +65,7 @@ async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
     if (!e.data?.non_ff) return { ok: false, error: e.message };
     const proceed = await dialogs.open({
       title: "Branch has diverged",
-      message: `the local ${branch} has diverged from ${pull_remote || "origin"} (it was likely rebased or force-pushed) — overwrite the local copy with the remote's?`,
+      message: `the local ${branch} has diverged from ${source} (it was likely rebased or force-pushed) — overwrite the local copy with the remote's?`,
       okLabel: "Overwrite",
       cancelLabel: "Skip",
     });
@@ -75,6 +77,33 @@ async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
       return { ok: false, error: e2.message };
     }
   }
+}
+
+// Fetch a remote branch into a local one of the same name, by bare branch name —
+// the shared step every non-PR "attach existing branch" source (bundle,
+// remote-branch search) starts from. Only works when the branch actually lives
+// on `pull_remote` itself — see fetchPrHead for PR targets, where that isn't
+// guaranteed.
+async function fetchRemoteBranch(dialogs, { path, branch, pull_remote }) {
+  return _fetchWithOverwritePrompt(dialogs, branch, pull_remote || "origin", (force) =>
+    postJSON("/api/code/remote-branch/fetch", { path, branch, pull_remote, force }),
+  );
+}
+
+// Fetch a PR's head via GitHub's refs/pull/<number>/head, straight from the PR's
+// own repo (github, e.g. "odoo/odoo") — the shared step every PR-based "attach
+// existing branch" source (resolvePrBranches, so createWorkspaceFromPRs/
+// createReviewWorkspace/createSubWorkspaceFromForwardPort) starts from. Unlike
+// fetchRemoteBranch (by bare branch name off a locally-configured remote), this
+// doesn't depend on any local repo's pull_remote/push_remote happening to point
+// at the exact repo the PR lives on — which isn't guaranteed for a contributor's
+// fork, a forward-port opened against the canonical repo while the local
+// checkout points at a company fork, or a colleague's WIP pushed to a shared
+// staging remote instead of the repo itself.
+async function fetchPrHead(dialogs, { path, github, number, branch }) {
+  return _fetchWithOverwritePrompt(dialogs, branch, github, (force) =>
+    postJSON("/api/code/remote-branch/fetch-pr", { path, github, number, branch, force }),
+  );
 }
 
 // The values a template prefills into the create form (also the payload its
@@ -721,10 +750,15 @@ export async function resolvePrBranches(plugins, targets) {
         const head = await postJSON("/api/prs/head", { repo: pull.github, number: pull.number });
         const branch = head.branch;
         if (!branch) throw new Error("could not resolve the PR's head branch");
-        const r = await fetchRemoteBranch(dialogs, {
+        // fetched straight from pull.github (the PR's own repo) — not any
+        // locally-configured remote, which has no guarantee of pointing at that
+        // exact repo (a fork, a forward-port's canonical repo differing from a
+        // company-fork checkout, a colleague's staging remote, ...).
+        const r = await fetchPrHead(dialogs, {
           path: repo.path,
+          github: pull.github,
+          number: pull.number,
           branch,
-          pull_remote: repo.push_remote || "dev",
         });
         if (!r.ok) throw new Error(r.error);
         eventLog.finish(eid, "done");
@@ -827,22 +861,45 @@ export const REVIEW_CATEGORY = "review";
 // Headless counterpart to createWorkspaceFromPRs — no dialog, called automatically
 // when a PR (and any sibling PR auto-discovered on the same branch) is added in the
 // Reviews screen (see reviews.js addPr/discoverSiblings, gated on
-// config.auto_workspace_on_review). Always a worktree workspace, category "review",
+// config.auto_workspace_on_review), and also by the manual "Review" action
+// (reviewGroup, reviews.js). Always a worktree workspace, category "review",
 // attaching the already-fetched branches (createBranches: false) — never activated
 // (worktree workspaces never go through the main-checkout "activate" step) and
 // never stealing the current UI selection (select: false).
 // targets: [{repo, pull: {github, number}}], one per repo the task spans.
+// Returns the workspace id (new or pre-existing) on success, or a falsy value on
+// failure — callers use this both as a truthy check and to resolve the record.
 export async function createReviewWorkspace(plugins, targets) {
   const { config } = plugins;
+  if (!targets.length) return null;
+  const findExisting = (name) =>
+    (config.config.workspaces || []).find((w) => w.category === REVIEW_CATEGORY && w.name === name);
+  // Resolve just the primary target's head branch first — a read-only lookup, no
+  // fetch — so a review workspace already tracking this task can be reused WITHOUT
+  // ever touching git. resolvePrBranches' fetchRemoteBranch would otherwise try to
+  // re-fetch a branch that's already checked out in that very workspace's
+  // worktree, which git refuses ("fatal: refusing to fetch into branch ... checked
+  // out at ..."). Only reachable on a re-run (the manual "Review" action clicked
+  // again, or the auto-hook firing a second time) — a brand-new task has nothing
+  // to find here and just falls through to the full resolve below.
+  try {
+    const head = await postJSON("/api/prs/head", {
+      repo: targets[0].pull.github,
+      number: targets[0].pull.number,
+    });
+    const existingByHead = head.branch && findExisting(head.branch);
+    if (existingByHead) return existingByHead.id;
+  } catch {
+    /* couldn't resolve cheaply — fall through to the full resolve, which reports
+       any real failure itself */
+  }
   const got = await resolvePrBranches(plugins, targets);
-  if (!got) return;
+  if (!got) return null;
   const name = got[0].branch;
   // idempotent: a branch already added once (e.g. its first PR, before a sibling
   // showed up) keeps its original workspace rather than spawning a duplicate.
-  const existing = (config.config.workspaces || []).some(
-    (w) => w.category === REVIEW_CATEGORY && w.name === name,
-  );
-  if (existing) return;
+  const existing = findExisting(name);
+  if (existing) return existing.id;
   if (!(config.config.workspace_categories || []).some((c) => c.id === REVIEW_CATEGORY)) {
     config.updateConfig({
       workspace_categories: [
@@ -882,6 +939,44 @@ export async function createReviewWorkspace(plugins, targets) {
     category: REVIEW_CATEGORY,
     select: false,
   });
+}
+
+// Fixed, non-editable safety preamble prepended to every Claude review run (auto or
+// manual) — Claude already runs with --permission-mode bypassPermissions for every
+// conversation in this app (full bash access, no confirmation gate — see
+// ClaudeManager, backend/server.py), so this is the only guardrail keeping a review
+// conversation read-only-ish. Not part of the user-editable review_prompt.md, so it
+// can't be accidentally edited away.
+const REVIEW_SAFETY_PREAMBLE = `You are running as an automated code review assistant with full local shell access and no confirmation prompts. Stay read-only with respect to anything outside the local checkout:
+- Never run "git push", or anything that publishes local commits/branches to a remote.
+- Never run "gh pr comment", "gh pr review", "gh pr merge", "gh pr close", "gh pr edit", "gh pr ready", or any other command that mutates a PR/issue/repo on GitHub.
+- Never take any other network-mutating action.
+- Freely read files, run tests/linters, and use local git (diff, log, blame, status) to understand the change.
+Report your findings as a normal reply; do not act on them beyond this conversation.`;
+
+// Fixed, non-editable — appended after the user's template so every review reports a
+// parseable merge-readiness score (ClaudePlugin.reviewScore parses "Score: N/100" out
+// of the conversation to drive the Reviews screen's score badge). Kept out of the
+// editable review_prompt.md for the same reason as the safety preamble: the app
+// depends on this exact format, so it can't be accidentally edited away.
+const REVIEW_SCORE_INSTRUCTION = `Finally, on its own line at the very end of your reply, give your honest guess of this PR's merge readiness as a score out of 100, in exactly this format: "Score: N/100" — 0 meaning there's nothing good about it yet, 100 meaning it's perfect and absolutely ready to merge as-is. This is a rough guess of how much work remains, not a rule-based checklist.`;
+
+// Run (or continue) a Claude review in an already-resolved review workspace: fetches
+// the current review_prompt.md template fresh (edited rarely — no caching needed),
+// substitutes {{branch}}/{{repos}}, sandwiches it between the fixed safety preamble
+// and the fixed scoring instruction, and sends it exactly as a user typing into that
+// workspace's own Claude tab would (ClaudePlugin.send) — the review IS that
+// conversation, nothing else to wire up. `review: true` has the backend save the
+// reply to disk (backend/server.py's ClaudeManager) so it's still there — in that
+// same Claude tab — after a goo restart, unlike an ordinary chat turn.
+// plugins: needs a `claude` key (ClaudePlugin) alongside the usual bundle.
+export async function runClaudeReview(plugins, ws) {
+  const template = await fetchReviewPrompt();
+  const repos = (ws.checkouts || []).map((c) => c.repo).join(", ");
+  const prompt = `${REVIEW_SAFETY_PREAMBLE}\n\n${template}\n\n${REVIEW_SCORE_INSTRUCTION}`
+    .replaceAll("{{branch}}", ws.name)
+    .replaceAll("{{repos}}", repos);
+  return plugins.claude.send(ws, prompt, { review: true });
 }
 
 // Adopt the current checkout: turn whatever is checked out in the main server

@@ -1575,12 +1575,23 @@ class ClaudeManager:
         if item.get("role") != "user":
             self.bus.publish_claude({"workspace": target, **item})
 
-    def send(self, target, prompt, cwd, add_dirs=None, model=None):
+    def send(self, target, prompt, cwd, add_dirs=None, model=None, review=False):
         """Spawn a Claude turn for <target> in <cwd> (its worktree checkout), resuming
         the target's session when one exists. `model` (a CLI alias/name, e.g. "sonnet"
-        or "opus[1m]") overrides the CLI's default when set. Returns (ok, detail)."""
+        or "opus[1m]") overrides the CLI's default when set. `review=True` marks this
+        turn's assistant reply for persistence to disk on completion (see
+        _persist_review) — so a review survives a goo restart, unlike an ordinary chat
+        turn. Returns (ok, detail)."""
         if not target or not (prompt or "").strip():
             return False, "missing workspace or prompt"
+        # expanduser everything up front: effects.is_dir/GitService._git already do
+        # this internally for their own checks, but subprocess.Popen below takes cwd
+        # literally (no shell involved to expand a leading "~" itself) — a
+        # worktree_dir setting like "~/Coding/worktrees" would otherwise pass the
+        # is_dir check (which expands) and then fail Popen with ENOENT on the raw,
+        # unexpanded path.
+        cwd = os.path.expanduser(cwd)
+        add_dirs = [os.path.expanduser(d) for d in (add_dirs or []) if d]
         if not effects.is_dir(cwd):
             return False, f"worktree checkout not found: {cwd}"
         with self.lock:
@@ -1614,10 +1625,14 @@ class ClaudeManager:
             cmd += ["--model", model]
         if session:
             cmd += ["--resume", session]
-        for d in [*(add_dirs or []), ctx_dir]:
+        for d in [*add_dirs, ctx_dir]:
             if d:
                 cmd += ["--add-dir", d]
         self._emit(target, {"role": "user", "text": prompt})
+        with self.lock:
+            e = self._entry(target)
+            e["review"] = review
+            e["review_turn_start"] = len(e["history"])
         self.bus.publish_log(f"{TAG} claude ({target}) in {cwd}: {' '.join(cmd)}")
         effects.trace("run", " ".join(cmd))
         # --add-dir dirs auto-load their .claude/skills/ (a documented exception), but
@@ -1721,8 +1736,27 @@ class ClaudeManager:
             if not ok:
                 item["error"] = obj.get("result") or obj.get("error") or "claude reported an error"
             self._emit(target, item)
+            if ok:
+                self._persist_review(target)
             return True
         return False
+
+    def _persist_review(self, target):
+        """If this turn was started with review=True (see send()), save its assistant
+        text to disk as markdown — so it's still there after a goo restart, when this
+        in-memory transcript is gone. Overwrites any earlier review for this target."""
+        with self.lock:
+            e = self.convos.get(target)
+            if not e or not e.get("review"):
+                return
+            turn = list(e["history"][e.get("review_turn_start") or 0 :])
+            e["review"] = False
+            e["review_turn_start"] = None
+        text = "\n\n".join(
+            it["text"].strip() for it in turn if it.get("role") == "assistant" and it.get("text")
+        ).strip()
+        if text:
+            effects.write_text(_review_path(target), text)
 
     def stop(self, target):
         """Interrupt a running Claude turn (idempotent)."""
@@ -1744,20 +1778,37 @@ class ClaudeManager:
         return True, "stopped"
 
     def history_for(self, target):
-        """The transcript + live state for one target, to re-prime the chat on load."""
+        """The transcript + live state for one target, to re-prime the chat on load.
+        Falls back to the on-disk persisted review (see send()/_persist_review) when
+        memory holds nothing and no turn is running — e.g. right after a goo restart,
+        the usual case this covers, since the in-memory transcript doesn't survive
+        one."""
         with self.lock:
             e = self.convos.get(target)
-            if not e:
-                return {"items": [], "state": "idle"}
-            return {"items": list(e["history"]), "state": e["state"]}
+            state = e["state"] if e else "idle"
+            items = list(e["history"]) if e else []
+        if not items and state != "running":
+            persisted = effects.read_text(_review_path(target))
+            if persisted:
+                items = [{"role": "assistant", "text": persisted}]
+        return {"items": items, "state": state}
+
+    def review_text(self, target):
+        """The raw persisted review markdown for <target> (see _persist_review), or ""
+        if none was ever saved. Straight from disk regardless of the in-memory
+        conversation state — unlike history_for's fallback, this is for a UI that
+        wants just the finished review text, not a chat transcript to re-prime."""
+        return effects.read_text(_review_path(target)) or ""
 
     def forget(self, target):
-        """Drop a workspace's conversation (its worktree was removed)."""
+        """Drop a workspace's conversation (its worktree was removed) and any review
+        persisted for it."""
         self.stop(target)
         with self.lock:
             e = self.convos.pop(target, None)
         if e and e.get("ctx_dir"):
             effects.remove_tree(e["ctx_dir"])
+        effects.remove_file(_review_path(target))
 
     def shutdown(self):
         """Stop every running turn (goo exit / restart), and clean up every
@@ -1823,6 +1874,44 @@ CI = services.CiService(effects, os.path.join(os.path.dirname(CONFIG_PATH), "ci_
 DOCKER_INFRA = services.DockerInfraService(
     effects, os.path.join(os.path.dirname(CONFIG_PATH), "docker", "nginx.conf")
 )
+
+# The user-editable Claude review prompt template: a real .md file (not a config.json
+# field) so it's comfortable to edit as prose. Lives next to config.json, same
+# reasoning as CI/DOCKER_INFRA above.
+REVIEW_PROMPT_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "review_prompt.md")
+
+# Persisted Claude review results: one markdown file per workspace, so a finished
+# review survives a goo restart (ClaudeManager's transcript below is in-memory
+# only). Lives next to config.json, same reasoning as REVIEW_PROMPT_PATH above.
+REVIEWS_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "reviews")
+
+
+def _review_path(target):
+    """The on-disk file holding <target>'s latest review. Workspace ids are already
+    filesystem-safe slugs (see WorkspacePlugin._newId in the frontend), but sanitize
+    defensively since this builds a path from client-supplied data."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", target).strip("-.") or "workspace"
+    return os.path.join(REVIEWS_DIR, f"{safe}.md")
+
+
+DEFAULT_REVIEW_PROMPT = (
+    "Review the changes on branch {{branch}} (repos: {{repos}}).\n\n"
+    "Focus on correctness bugs, edge cases, and anything inconsistent with the rest "
+    "of the codebase. Call out risky assumptions and missing test coverage. Suggest "
+    "a simpler alternative only where it genuinely improves the change — skip pure "
+    "style nitpicks. Order findings most- to least-important, and say plainly when "
+    "you're not confident rather than guessing.\n"
+)
+
+
+def _review_prompt_text():
+    """The template's current text, bootstrapping the shipped default to disk on
+    first access."""
+    text = effects.read_text(REVIEW_PROMPT_PATH)
+    if text is None:
+        effects.write_text(REVIEW_PROMPT_PATH, DEFAULT_REVIEW_PROMPT)
+        return DEFAULT_REVIEW_PROMPT
+    return text
 
 
 def _autoreload_repos():
@@ -2212,6 +2301,7 @@ def _api_workspace_claude(body):
         body["cwd"],
         body.get("addDirs") or [],
         model=body.get("model"),
+        review=bool(body.get("review")),
     )
     if ok:
         return {"ok": True, "state": detail["state"]}
@@ -2227,6 +2317,19 @@ def _api_workspace_claude_stop(body):
 @post_route("/api/workspace/claude/history", "workspace")
 def _api_workspace_claude_history(body):
     return {"ok": True, **CLAUDE.history_for(body["workspace"])}
+
+
+@post_route("/api/workspace/claude/review", "workspace")
+def _api_workspace_claude_review(body):
+    return {"ok": True, "text": CLAUDE.review_text(body["workspace"])}
+
+
+@post_route("/api/review-prompt")
+def _api_review_prompt_save(body):
+    ok, error = effects.write_text(REVIEW_PROMPT_PATH, body.get("content") or "")
+    if ok:
+        return {"ok": True}
+    return 500, {"ok": False, "error": error or "write failed"}
 
 
 # ── git: branches, checkouts, commits, history ───────────────────────────────
@@ -2338,6 +2441,18 @@ def _api_code_remote_branches_search(body):
 def _api_code_remote_branch_fetch(body):
     ok, error, non_ff = GIT.fetch_remote_branch(
         body["path"], body["branch"], pull_remote=body.get("pull_remote"), force=bool(body.get("force"))
+    )
+    return (200 if ok else 400), {"ok": ok, "error": error, "non_ff": non_ff}
+
+
+@post_route("/api/code/remote-branch/fetch-pr", "path", "github", "number", "branch")
+def _api_code_remote_branch_fetch_pr(body):
+    ok, error, non_ff = GIT.fetch_pr_head(
+        body["path"],
+        body["github"],
+        body["number"],
+        body["branch"],
+        force=bool(body.get("force")),
     )
     return (200 if ok else 400), {"ok": ok, "error": error, "non_ff": non_ff}
 
@@ -2728,6 +2843,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_shell()
         elif path == "/api/config":
             self._send_json(200, {"ok": True, **CONFIG.get()})
+        elif path == "/api/review-prompt":
+            self._send_json(200, {"ok": True, "content": _review_prompt_text()})
         else:
             self._send_json(404, {"ok": False, "error": "not_found"})
 
@@ -3206,11 +3323,15 @@ def main():
     # loaded/cached yet at startup.
     if args.config:
         CONFIG.path = os.path.expanduser(args.config)
-        # keep the CI cache and generated nginx.conf beside the chosen config file
+        # keep the CI cache, generated nginx.conf, review prompt, and saved
+        # reviews beside the chosen config file
         CI.cache_path = os.path.join(os.path.dirname(CONFIG.path), "ci_merge_stats.json")
         DOCKER_INFRA.nginx_conf_path = os.path.join(
             os.path.dirname(CONFIG.path), "docker", "nginx.conf"
         )
+        global REVIEW_PROMPT_PATH, REVIEWS_DIR
+        REVIEW_PROMPT_PATH = os.path.join(os.path.dirname(CONFIG.path), "review_prompt.md")
+        REVIEWS_DIR = os.path.join(os.path.dirname(CONFIG.path), "reviews")
 
     # DatabaseService/AssetsService's psql calls never pass connection info of
     # their own -- they rely entirely on psql's defaults (a local unix socket,

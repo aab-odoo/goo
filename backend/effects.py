@@ -212,6 +212,18 @@ def remove_tree(path):
         return False, str(e)
 
 
+def remove_file(path):
+    """Delete a single file. Returns (ok, error); a missing path is ok."""
+    trace("rm", path)
+    p = os.path.expanduser(path)
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
 def move_path(src, dst):
     """Move/rename a path (src → dst). Returns (ok, error)."""
     trace("move", f"{src} → {dst}")
