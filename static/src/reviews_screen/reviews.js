@@ -286,15 +286,11 @@ export class ReviewsScreen extends Component {
         .map((p) => ({ repo: this._repoFor(p.github), pull: p }))
         .filter((t) => t.repo && t.repo.path);
       if (targets.length) {
-        const plugins = this._dialogPlugins();
         const wsId =
-          this.reviewWorkspaceFor(branch)?.id || (await createReviewWorkspace(plugins, targets));
+          this.reviewWorkspaceFor(branch)?.id ||
+          (await createReviewWorkspace(this._dialogPlugins(), targets));
         if (wsId && this.config.config.auto_claude_review) {
-          await this.claude.prime(wsId);
-          if (this.reviewStateFor(branch) === "none") {
-            const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
-            if (ws) await runClaudeReview(plugins, ws);
-          }
+          await this._runReviewIfNeeded(wsId, branch);
         }
       }
     }
@@ -433,16 +429,27 @@ export class ReviewsScreen extends Component {
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
   }
 
+  // Prime <wsId>'s conversation and start its Claude review ONLY if one hasn't
+  // already started ("none" state — never while "running" or "done", so calling
+  // this again never re-asks Claude to review again). Shared by _startReview
+  // (the group-header icon / task menu's explicit "Review" action, which always
+  // wants a review) and addPr's auto-review hook (which only wants one when
+  // config.auto_claude_review is on — the caller gates that, not this helper).
+  async _runReviewIfNeeded(wsId, branch) {
+    await this.claude.prime(wsId);
+    if (this.reviewStateFor(branch) === "none") {
+      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+      if (ws) await runClaudeReview(this._dialogPlugins(), ws);
+    }
+  }
+
   // Ensure a review workspace exists for this task (idempotent) and start its
-  // Claude review ONLY if one hasn't already started ("none" state — never
-  // while "running" or "done", so re-clicking never re-asks Claude to review
-  // again). Returns the workspace id (or null on failure — an error is already
-  // surfaced by resolvePrBranches/createWorktree). Shared by the group-header
-  // icon (onReviewIconClick, stays on this screen) and reviewGroup (the task
-  // menu's "Review" action, which navigates afterward).
+  // Claude review (see _runReviewIfNeeded). Returns the workspace id (or null on
+  // failure — an error is already surfaced by resolvePrBranches/createWorktree).
+  // Shared by the group-header icon (onReviewIconClick, stays on this screen) and
+  // reviewGroup (the task menu's "Review" action, which navigates afterward).
   async _startReview(rows) {
     const branch = rows[0]?.branch;
-    const plugins = this._dialogPlugins();
     // fast path: the group's rows already carry their resolved branch name (no
     // fetch needed) — reuse an existing review workspace straight away rather
     // than going through createReviewWorkspace's own (network) pre-check.
@@ -450,14 +457,10 @@ export class ReviewsScreen extends Component {
     if (!wsId) {
       const targets = this._targetsFor(rows);
       if (!targets.length) return null;
-      wsId = await createReviewWorkspace(plugins, targets);
+      wsId = await createReviewWorkspace(this._dialogPlugins(), targets);
     }
     if (!wsId) return null;
-    await this.claude.prime(wsId);
-    if (this.reviewStateFor(branch) === "none") {
-      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
-      if (ws) await runClaudeReview(plugins, ws);
-    }
+    await this._runReviewIfNeeded(wsId, branch);
     return wsId;
   }
 
