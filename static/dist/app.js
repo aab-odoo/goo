@@ -419,8 +419,8 @@ function inlineMd(text) {
   let s = escapeHtml(text);
   s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
   s = s.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    (_, label, url) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`
+    /\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,
+    (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`
   );
   s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");
@@ -11056,14 +11056,9 @@ var ReviewsScreen = class extends Component {
     if (branch && this.config.config.auto_workspace_on_review) {
       const targets = [ref, ...siblings].map((p) => ({ repo: this._repoFor(p.github), pull: p })).filter((t2) => t2.repo && t2.repo.path);
       if (targets.length) {
-        const plugins = this._dialogPlugins();
-        const wsId = this.reviewWorkspaceFor(branch)?.id || await createReviewWorkspace(plugins, targets);
+        const wsId = this.reviewWorkspaceFor(branch)?.id || await createReviewWorkspace(this._dialogPlugins(), targets);
         if (wsId && this.config.config.auto_claude_review) {
-          await this.claude.prime(wsId);
-          if (this.reviewStateFor(branch) === "none") {
-            const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
-            if (ws) await runClaudeReview(plugins, ws);
-          }
+          await this._runReviewIfNeeded(wsId, branch);
         }
       }
     }
@@ -11183,28 +11178,34 @@ var ReviewsScreen = class extends Component {
     if (!targets.length) return;
     return createWorkspaceFromPRs(this._dialogPlugins(), targets);
   }
+  // Prime <wsId>'s conversation and start its Claude review ONLY if one hasn't
+  // already started ("none" state — never while "running" or "done", so calling
+  // this again never re-asks Claude to review again). Shared by _startReview
+  // (the group-header icon / task menu's explicit "Review" action, which always
+  // wants a review) and addPr's auto-review hook (which only wants one when
+  // config.auto_claude_review is on — the caller gates that, not this helper).
+  async _runReviewIfNeeded(wsId, branch) {
+    await this.claude.prime(wsId);
+    if (this.reviewStateFor(branch) === "none") {
+      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
+      if (ws) await runClaudeReview(this._dialogPlugins(), ws);
+    }
+  }
   // Ensure a review workspace exists for this task (idempotent) and start its
-  // Claude review ONLY if one hasn't already started ("none" state — never
-  // while "running" or "done", so re-clicking never re-asks Claude to review
-  // again). Returns the workspace id (or null on failure — an error is already
-  // surfaced by resolvePrBranches/createWorktree). Shared by the group-header
-  // icon (onReviewIconClick, stays on this screen) and reviewGroup (the task
-  // menu's "Review" action, which navigates afterward).
+  // Claude review (see _runReviewIfNeeded). Returns the workspace id (or null on
+  // failure — an error is already surfaced by resolvePrBranches/createWorktree).
+  // Shared by the group-header icon (onReviewIconClick, stays on this screen) and
+  // reviewGroup (the task menu's "Review" action, which navigates afterward).
   async _startReview(rows) {
     const branch = rows[0]?.branch;
-    const plugins = this._dialogPlugins();
     let wsId = this.reviewWorkspaceFor(branch)?.id;
     if (!wsId) {
       const targets = this._targetsFor(rows);
       if (!targets.length) return null;
-      wsId = await createReviewWorkspace(plugins, targets);
+      wsId = await createReviewWorkspace(this._dialogPlugins(), targets);
     }
     if (!wsId) return null;
-    await this.claude.prime(wsId);
-    if (this.reviewStateFor(branch) === "none") {
-      const ws = (this.config.config.workspaces || []).find((w) => w.id === wsId);
-      if (ws) await runClaudeReview(plugins, ws);
-    }
+    await this._runReviewIfNeeded(wsId, branch);
     return wsId;
   }
   // the task menu's "Review" action: same as the group-header icon, but always

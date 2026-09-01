@@ -2433,6 +2433,38 @@ class GitServiceTest(unittest.TestCase):
         self.assertEqual((ok, err, non_ff), (True, None, False))
         self.assertIn("fetch dev +master-x:master-x", " ".join(io.run_calls[-1]))
 
+    def test_fetch_pr_head_uses_the_pr_s_own_repo_not_a_local_remote(self):
+        # refs/pull/<n>/head only ever resolves against the exact repo the PR was
+        # opened on — fetch_pr_head must go straight to https://github.com/<github>.git
+        # rather than any locally-configured remote (see the method's own docstring).
+        io = FakeIO()
+        ok, err, non_ff = services.GitService(io).fetch_pr_head(
+            "/r", "odoo-dev/odoo", 123, "master-x"
+        )
+        self.assertEqual((ok, err, non_ff), (True, None, False))
+        cmd = " ".join(io.run_calls[-1])
+        self.assertIn("fetch https://github.com/odoo-dev/odoo.git", cmd)
+        self.assertIn("refs/pull/123/head:master-x", cmd)
+
+    def test_fetch_pr_head_force_uses_plus_refspec(self):
+        io = FakeIO()
+        services.GitService(io).fetch_pr_head("/r", "odoo/odoo", 1, "master-x", force=True)
+        self.assertIn("+refs/pull/1/head:master-x", " ".join(io.run_calls[-1]))
+
+    def test_fetch_pr_head_non_fast_forward_flagged(self):
+        io = FakeIO(
+            runs={
+                "fetch": completed(
+                    returncode=1,
+                    stderr="From github.com:odoo/odoo\n"
+                    " ! [rejected]        refs/pull/1/head -> master-x  (non-fast-forward)\n",
+                )
+            }
+        )
+        ok, err, non_ff = services.GitService(io).fetch_pr_head("/r", "odoo/odoo", 1, "master-x")
+        self.assertFalse(ok)
+        self.assertTrue(non_ff)
+
     def test_fetch_master_uses_pull_remote(self):
         io = FakeIO()
         services.GitService(io).fetch_master(

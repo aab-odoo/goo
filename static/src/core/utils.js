@@ -62,9 +62,14 @@ export function reviewScoreClass(score) {
 function inlineMd(text) {
   let s = escapeHtml(text);
   s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
+  // the URL itself excludes quotes (on top of whitespace/")" already excluded to find
+  // the link's closing paren) — escapeHtml only strips &/</>, not ' or ", so a raw
+  // quote reaching here would otherwise close the href="..." attribute early and let
+  // the rest of the "URL" inject arbitrary attributes (e.g. onmouseover=...). The
+  // .replace is defense in depth for any quote that slips through some other way.
   s = s.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    (_, label, url) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`,
+    /\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,
+    (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`,
   );
   s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");

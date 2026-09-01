@@ -1572,6 +1572,12 @@ class ClaudeManager:
             e = self._entry(target)
             e["history"].append(item)
             del e["history"][: -self.HISTORY_MAX]
+            # tally how many items the in-flight review turn has produced so far (see
+            # send()/_persist_review) — counted rather than recorded as a fixed index
+            # into history, since the HISTORY_MAX trim above can shift/drop earlier
+            # indices out from under a long turn.
+            if e.get("review"):
+                e["review_count"] = e.get("review_count", 0) + 1
         if item.get("role") != "user":
             self.bus.publish_claude({"workspace": target, **item})
 
@@ -1632,7 +1638,7 @@ class ClaudeManager:
         with self.lock:
             e = self._entry(target)
             e["review"] = review
-            e["review_turn_start"] = len(e["history"])
+            e["review_count"] = 0
         self.bus.publish_log(f"{TAG} claude ({target}) in {cwd}: {' '.join(cmd)}")
         effects.trace("run", " ".join(cmd))
         # --add-dir dirs auto-load their .claude/skills/ (a documented exception), but
@@ -1749,9 +1755,13 @@ class ClaudeManager:
             e = self.convos.get(target)
             if not e or not e.get("review"):
                 return
-            turn = list(e["history"][e.get("review_turn_start") or 0 :])
+            # tail slice by count (see _emit), not a fixed index: history may have
+            # been trimmed to HISTORY_MAX mid-turn, which would shift/invalidate a
+            # remembered start index but leaves a from-the-end count still correct.
+            count = e.get("review_count") or 0
+            turn = list(e["history"][-count:]) if count else []
             e["review"] = False
-            e["review_turn_start"] = None
+            e["review_count"] = 0
         text = "\n\n".join(
             it["text"].strip() for it in turn if it.get("role") == "assistant" and it.get("text")
         ).strip()
