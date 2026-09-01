@@ -55,26 +55,42 @@ export function reviewScoreClass(score) {
   return "low";
 }
 
-// inline markdown spans (code/links/bold/italic) within one already-escaped line
-// of text — order matters: code spans first (so **/_ inside `code` are left
-// alone), then links, then bold before italic (so "**x**" isn't read as
-// italic-of-"*x*").
+// inline markdown spans (code/links/bold/italic) within one line of text — order
+// matters: code AND link spans are pulled out FIRST, before the bold/italic
+// passes run, and swapped back in verbatim at the very end. A regex has no
+// notion of "inside a tag": running the bold/italic passes over already-emitted
+// <code>/<a> HTML (as this used to) means any two underscores anywhere within —
+// or even across — those spans (e.g. `base_import/models/base_import.py`, two
+// separate `load`/`load_records` code spans, or a link URL like
+// https://x.com/a_b_c) get misread as an italic delimiter pair and silently
+// eaten. Pulling both out into opaque placeholders first means the bold/italic
+// regexes genuinely never see that content — the trade-off is that markdown
+// emphasis inside a link's label isn't recognized either, which this renderer
+// never documented as supported anyway.
 function inlineMd(text) {
-  let s = escapeHtml(text);
-  s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
+  const spans = []; // pre-rendered <code>/<a> HTML, restored verbatim at the end
+  const stash = (html) => {
+    spans.push(html);
+    // \0 can't occur in real text (nor survive escapeHtml, which only touches
+    // &/</>) — a placeholder built from ordinary characters (digits, letters)
+    // could collide with the text around it (e.g. "line 51" containing "51").
+    return `\0${spans.length - 1}\0`;
+  };
+  let s = text.replace(/`([^`]+?)`/g, (_, code) => stash(`<code>${escapeHtml(code)}</code>`));
+  s = escapeHtml(s);
   // the URL itself excludes quotes (on top of whitespace/")" already excluded to find
   // the link's closing paren) — escapeHtml only strips &/</>, not ' or ", so a raw
   // quote reaching here would otherwise close the href="..." attribute early and let
   // the rest of the "URL" inject arbitrary attributes (e.g. onmouseover=...). The
   // .replace is defense in depth for any quote that slips through some other way.
-  s = s.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,
-    (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`,
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g, (_, label, url) =>
+    stash(`<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`),
   );
   s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>");
   s = s.replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>");
+  s = s.replace(/\0(\d+)\0/g, (_, i) => spans[i]);
   return s;
 }
 
@@ -146,7 +162,8 @@ export function mdToHtml(text) {
       flushPara();
       flushList();
       const quote = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+      while (i < lines.length && /^>\s?/.test(lines[i]))
+        quote.push(lines[i++].replace(/^>\s?/, ""));
       out.push(`<blockquote><p>${inlineMd(quote.join(" "))}</p></blockquote>`);
       continue;
     }

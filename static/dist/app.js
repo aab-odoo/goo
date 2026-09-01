@@ -416,16 +416,22 @@ function reviewScoreClass(score) {
   return "low";
 }
 function inlineMd(text) {
-  let s = escapeHtml(text);
-  s = s.replace(/`([^`]+?)`/g, (_, code) => `<code>${code}</code>`);
+  const spans = [];
+  const stash = (html) => {
+    spans.push(html);
+    return `\0${spans.length - 1}\0`;
+  };
+  let s = text.replace(/`([^`]+?)`/g, (_, code) => stash(`<code>${escapeHtml(code)}</code>`));
+  s = escapeHtml(s);
   s = s.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,
-    (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`
+    (_, label, url) => stash(`<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`)
   );
   s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/__([^_]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>");
   s = s.replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>");
+  s = s.replace(/\0(\d+)\0/g, (_, i) => spans[i]);
   return s;
 }
 function mdToHtml(text) {
@@ -488,7 +494,8 @@ function mdToHtml(text) {
       flushPara();
       flushList();
       const quote = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+      while (i < lines.length && /^>\s?/.test(lines[i]))
+        quote.push(lines[i++].replace(/^>\s?/, ""));
       out.push(`<blockquote><p>${inlineMd(quote.join(" "))}</p></blockquote>`);
       continue;
     }
