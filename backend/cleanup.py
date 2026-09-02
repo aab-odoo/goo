@@ -31,7 +31,7 @@ import sys
 import time
 
 from . import effects
-from .server import CONFIG, GIT, GITHUB, MERGEBOT
+from .server import CLAUDE, CONFIG, GIT, GITHUB, MERGEBOT
 
 STATE_DIR = os.path.expanduser("~/.local/state/goo")
 LOG_PATH = os.path.join(STATE_DIR, "cleanup.log")
@@ -203,6 +203,11 @@ def _delete(ws, repo_map, config, dry_run):
         log.info(f"  [dry-run] would remove directory: {ws_dir}")
     else:
         effects.remove_tree(ws_dir)
+        # mirrors /api/workspace/remove's own forget() call — drops any Claude
+        # conversation for this workspace and any review .md persisted for it
+        # (see server.ClaudeManager.forget), so a review task's markdown doesn't
+        # outlive the worktree it was written for.
+        CLAUDE.forget(ws["id"])
 
 
 def run(dry_run=False):
