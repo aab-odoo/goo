@@ -10672,14 +10672,14 @@ async function deleteWorkspaceDialog(ws, { config, code, db, eventLog, repoMap, 
       key: "delRemote",
       type: "checkbox",
       label: "\u2026also on the push remote",
-      value: true
+      value: false
     });
   if (prs.length)
     fields2.push({
       key: "closePrs",
       type: "checkbox",
       label: `Close ${prs.length === 1 ? "its open pull request" : `its ${prs.length} open pull requests`}`,
-      value: true
+      value: false
     });
   const dbExists = ws.db && db.databases().some((d) => d.name === ws.db);
   if (dbExists)
