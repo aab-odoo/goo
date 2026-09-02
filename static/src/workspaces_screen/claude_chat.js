@@ -1,8 +1,19 @@
 // The Claude tab's chat UI — the view half of claude_plugin.js (which owns the
 // per-workspace transcript, model choice and send/stop wire).
 
-import { Component, onMounted, usePlugin, useProps, signal, t, useEffect, xml } from "@odoo/owl";
+import {
+  Component,
+  onMounted,
+  usePlugin,
+  useProps,
+  signal,
+  t,
+  useEffect,
+  xml,
+  markup,
+} from "@odoo/owl";
 import { ClaudePlugin } from "./claude_plugin.js";
+import { mdToHtml } from "../core/utils.js";
 
 export class ClaudeChat extends Component {
   static template = xml`
@@ -20,7 +31,7 @@ export class ClaudeChat extends Component {
         </div>
         <t t-foreach="this.items" t-as="m" t-key="m_index">
           <div t-if="m.role === 'user'" class="cmsg cmsg-user"><div class="cmsg-body" t-out="m.text"/></div>
-          <div t-elif="m.role === 'assistant'" class="cmsg cmsg-asst"><div class="cmsg-body" t-out="m.text"/></div>
+          <div t-elif="m.role === 'assistant'" class="cmsg cmsg-asst"><div class="cmsg-body md-content" t-out="this.mdHtml(m.text)"/></div>
           <div t-elif="m.role === 'tool'" class="cmsg-tool">
             <span class="cmsg-tool-name" t-out="m.tool"/>
             <span t-if="m.text" class="cmsg-tool-text" t-out="m.text"/>
@@ -69,6 +80,12 @@ export class ClaudeChat extends Component {
 
   get running() {
     return this.claude.running(this.props.target.id);
+  }
+
+  // rendered fresh per message on every render (no signal cache) — chat replies
+  // are short enough that re-parsing is a non-issue, same call as ReviewPanel.html.
+  mdHtml(text) {
+    return markup(mdToHtml(text));
   }
 
   onKey(ev) {

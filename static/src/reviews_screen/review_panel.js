@@ -36,7 +36,7 @@ export class ReviewPanel extends Component {
       <div class="review-panel-body">
         <div t-if="this.loading()" class="commits-empty">loading…</div>
         <div t-elif="!this.text()" class="commits-empty">no review saved for this task yet</div>
-        <div t-else="" class="review-panel-text" t-out="this.html()"/>
+        <div t-else="" class="review-panel-text md-content" t-out="this.html()"/>
       </div>
       <div class="review-panel-foot">
         <button class="pbtn primary" t-on-click="() => this.continueToChat()">Continue to chat with claude</button>

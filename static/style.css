@@ -3058,75 +3058,77 @@ tr.active td.brg-commit {
   line-height: 1.6;
   color: var(--l-text);
 }
-.review-panel-text > :first-child {
+/* shared markdown typography for mdToHtml() output (core/utils.js) — consumed by
+   the review panel and the Claude chat's assistant bubbles */
+.md-content > :first-child {
   margin-top: 0;
 }
-.review-panel-text > :last-child {
+.md-content > :last-child {
   margin-bottom: 0;
 }
-.review-panel-text h1,
-.review-panel-text h2,
-.review-panel-text h3,
-.review-panel-text h4,
-.review-panel-text h5,
-.review-panel-text h6 {
+.md-content h1,
+.md-content h2,
+.md-content h3,
+.md-content h4,
+.md-content h5,
+.md-content h6 {
   margin: 18px 0 8px;
   line-height: 1.3;
 }
-.review-panel-text h1 {
+.md-content h1 {
   font-size: 18px;
 }
-.review-panel-text h2 {
+.md-content h2 {
   font-size: 16px;
 }
-.review-panel-text h3 {
+.md-content h3 {
   font-size: 14px;
 }
-.review-panel-text p {
+.md-content p {
   margin: 0 0 10px;
 }
-.review-panel-text ul,
-.review-panel-text ol {
+.md-content ul,
+.md-content ol {
   margin: 0 0 10px;
   padding-left: 22px;
 }
-.review-panel-text li {
+.md-content li {
   margin: 2px 0;
 }
-.review-panel-text code {
+.md-content code {
   font-family: var(--mono);
   font-size: 12px;
   background: var(--l-panel);
   padding: 1px 4px;
   border-radius: 3px;
 }
-.review-panel-text pre.md-code {
+.md-content pre.md-code {
   margin: 0 0 10px;
   padding: 10px 12px;
   background: var(--l-panel);
   border-radius: 6px;
   overflow-x: auto;
 }
-.review-panel-text pre.md-code code {
+.md-content pre.md-code code {
   background: none;
   padding: 0;
   font-size: 12px;
 }
-.review-panel-text blockquote {
+.md-content blockquote {
   margin: 0 0 10px;
   padding: 2px 12px;
   border-left: 3px solid var(--l-line);
   color: var(--l-text-mid);
 }
-.review-panel-text hr {
+.md-content hr {
   border: none;
   border-top: 1px solid var(--l-line);
   margin: 14px 0;
 }
-.review-panel-text a {
+.md-content a {
   color: var(--l-accent);
 }
-.review-panel-text a:hover {
+.md-content a:hover {
   text-decoration: underline;
 }
 .review-panel-foot {
