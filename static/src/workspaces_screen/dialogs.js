@@ -1112,14 +1112,14 @@ export async function deleteWorkspaceDialog(
       key: "delRemote",
       type: "checkbox",
       label: "…also on the push remote",
-      value: true,
+      value: false,
     });
   if (prs.length)
     fields.push({
       key: "closePrs",
       type: "checkbox",
       label: `Close ${prs.length === 1 ? "its open pull request" : `its ${prs.length} open pull requests`}`,
-      value: true,
+      value: false,
     });
   // only offer to drop the db if it actually exists (a never-run workspace has none)
   const dbExists = ws.db && db.databases().some((d) => d.name === ws.db);
